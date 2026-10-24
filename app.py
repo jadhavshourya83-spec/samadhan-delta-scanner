@@ -30,6 +30,9 @@ with st.sidebar:
     req_kst = st.checkbox("KST cross required (KST / signal)", True)
     req_vi = st.checkbox("Vortex cross required (VI+ / VI-)", True)
     req_smc = st.checkbox("SMC required (BOS/CHoCH + sweep ya FVG)", True)
+    st.subheader("Majors (nehmi scan hotat)")
+    pinned_bases = st.multiselect("Pinned coins", ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "AVAX", "LINK"],
+                                  default=["BTC", "ETH", "SOL", "DOGE"])
     refresh = st.selectbox("Refresh (seconds)", [30, 60, 90, 120], index=1)
     st.caption("Sagle ticked confirmations Momentum direction shi match zale tarach FINAL.")
 
@@ -93,7 +96,7 @@ def signal_score(t, turn_pct, max_move):
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def market_snapshot(min_turnover, scan_limit, min_signal, max_move):
+def market_snapshot(min_turnover, scan_limit, min_signal, max_move, pinned_bases=()):
     products = get("/v2/products", {"contract_types": "perpetual_futures", "states": "live", "page_size": 200})
     tickers = get("/v2/tickers", {"contract_types": "perpetual_futures"})
     if isinstance(products, dict):
@@ -110,8 +113,8 @@ def market_snapshot(min_turnover, scan_limit, min_signal, max_move):
             if sym:
                 by_symbol[sym] = t
     symbols = [p.get("symbol") for p in products if isinstance(p, dict) and p.get("symbol")]
-    if not symbols:
-        symbols = list(by_symbol)
+    # products list 200 var truncate hote; tickers madhle sagle symbols pan ghe
+    symbols = list(dict.fromkeys(list(by_symbol) + symbols))
 
     pool = []
     for sym in symbols:
@@ -126,16 +129,47 @@ def market_snapshot(min_turnover, scan_limit, min_signal, max_move):
     n = max(len(order) - 1, 1)
     rank = {sym: i / n for i, (sym, _, _) in enumerate(order)}
 
-    signals, extended = [], 0
+    def status(s):
+        if abs(s["24h Change %"]) > max_move:
+            return f'EXTENDED (24h {s["24h Change %"]:.1f}% > {max_move}%)'
+        if s["Signal Dir"] == "WAIT":
+            return "Direction WAIT (24h change ani range position match nahit)"
+        if s["Signal Score"] < min_signal:
+            return f'Score {s["Signal Score"]:.0f} < {min_signal}'
+        return "PASS"
+
+    signals, extended, scored = [], 0, {}
     for sym, t, turnover in pool:
         s = signal_score(t, rank[sym], max_move)
         s["Turnover"] = turnover
+        s["Stage1 Status"] = status(s)
+        scored[sym] = (sym, t, s)
         if abs(s["24h Change %"]) > max_move:
             extended += 1
-        if s["Signal Score"] >= min_signal and s["Signal Dir"] != "WAIT":
+        if s["Stage1 Status"] == "PASS":
             signals.append((sym, t, s))
     signals.sort(key=lambda x: x[2]["Signal Score"], reverse=True)
-    return signals[:scan_limit], len(symbols), len(tickers), len(pool), extended
+    signals = signals[:scan_limit]
+
+    # Pinned majors: Stage 1 pass zala nahi tari analyze hotat, ani karan dakhavtat
+    pinned, missing = [], []
+    for base in pinned_bases:
+        names = {base + "USD", base + "USDT"}
+        hit = [sym for sym in by_symbol if str(sym).upper() in names]
+        if not hit:
+            missing.append(base)
+            continue
+        sym = hit[0]
+        if sym in scored:
+            pinned.append(scored[sym])
+        else:
+            t = by_symbol[sym]
+            turnover = f(t, "turnover_usd", "turnover", "volume")
+            s = signal_score(t, 0.0, max_move)
+            s["Turnover"] = turnover
+            s["Stage1 Status"] = f"Turnover {turnover:.0f} < min {min_turnover}"
+            pinned.append((sym, t, s))
+    return signals, len(symbols), len(tickers), len(pool), extended, pinned, missing
 
 
 # ───────────────────────── CANDLES ─────────────────────────
@@ -340,11 +374,13 @@ def momentum(symbol, sig, threshold, cfg):
         required = [k for k, v in cfg["req"].items() if v]
         confirms_ok = all(conf[k] == mom_dir for k in required) if mom_dir != "WAIT" else False
 
-        base_ok = state == "FRESH" and mom_dir != "WAIT" and mom_dir == sig["Signal Dir"]
+        base_ok = state == "FRESH" and mom_dir != "WAIT" and mom_dir == sig["Signal Dir"] \
+            and sig.get("Stage1 Status") == "PASS"
         final = mom_dir if (base_ok and confirms_ok) else "NO"
 
         return {
             "Symbol": symbol, "Price": price, "State": state,
+            "Stage1": sig.get("Stage1 Status", "PASS"),
             "Signal Score": sig["Signal Score"], "Signal Dir": sig["Signal Dir"],
             "24h Change %": sig["24h Change %"], "OI Change 6h %": sig["OI Change 6h %"],
             "Momentum Dir": mom_dir, "Momentum Score": max(up, dn),
@@ -368,25 +404,33 @@ def chip(val, direction):
 st.markdown(f'<meta http-equiv="refresh" content="{refresh}">', unsafe_allow_html=True)
 try:
     with st.spinner("Stage 1: Early signal stocks shodhat ahe..."):
-        signals, n_products, n_tickers, n_pool, n_ext = market_snapshot(min_turnover, scan_limit, min_signal, max_move)
+        signals, n_products, n_tickers, n_pool, n_ext, pinned, missing = market_snapshot(
+            min_turnover, scan_limit, min_signal, max_move, tuple(pinned_bases))
 
     st.caption(f"Scan time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | Products: {n_products} | "
                f"Tickers: {n_tickers} | Turnover pass: {n_pool} | Aadhi move zalele (kadhle): {n_ext} | "
                f"Early signal stocks: {len(signals)}")
 
-    if not signals:
+    if missing:
+        st.warning(f"Ya coins che symbols Delta tickers madhe sapadle nahit: {', '.join(missing)}")
+    if not signals and not pinned:
         st.warning("Stage 1 madhe ekahi early signal nahi — NO TRADE.")
         st.stop()
 
     st.subheader("🎯 STAGE 1 — EARLY SIGNAL STOCKS")
-    sig_df = pd.DataFrame([{"Symbol": s, **v} for s, _, v in signals])
-    st.dataframe(sig_df[["Symbol", "Signal Dir", "Signal Score", "24h Change %", "OI Change 6h %", "Turnover"]],
-                 hide_index=True, use_container_width=True)
+    if signals:
+        sig_df = pd.DataFrame([{"Symbol": s, **v} for s, _, v in signals])
+        st.dataframe(sig_df[["Symbol", "Signal Dir", "Signal Score", "24h Change %", "OI Change 6h %", "Turnover"]],
+                     hide_index=True, use_container_width=True)
+    else:
+        st.info("Stage 1 madhe ekahi early signal nahi (khali Majors table bagha).")
 
     rows = []
     progress = st.progress(0)
     with ThreadPoolExecutor(max_workers=5) as pool:
-        jobs = {pool.submit(momentum, sym, sig, min_score, CFG): sym for sym, _, sig in signals}
+        done_syms = {s[0] for s in signals}
+        todo = list(signals) + [p for p in pinned if p[0] not in done_syms]
+        jobs = {pool.submit(momentum, sym, sig, min_score, CFG): sym for sym, _, sig in todo}
         for i, future in enumerate(as_completed(jobs), 1):
             r = future.result()
             if r:
@@ -400,7 +444,7 @@ try:
         st.stop()
 
     final = df[df.FINAL.isin(["UP", "DOWN"])].sort_values(["Confirms", "Momentum Score"], ascending=False).head(2)
-    near = df[(df.State.isin(["FRESH", "FORMING"])) & (df.FINAL == "NO")] \
+    near = df[(df.Stage1 == "PASS") & (df.State.isin(["FRESH", "FORMING"])) & (df.FINAL == "NO")] \
         .sort_values(["Confirms", "Signal Score"], ascending=False).head(6)
 
     a, b, c, d_ = st.columns(4)
@@ -432,6 +476,16 @@ try:
     else:
         st.dataframe(near[["Symbol", "State", "Signal Dir", "Momentum Dir", "Confirms", "DMI", "KST", "VI",
                            "SMC", "SMC Setup", "Signal Score", "Momentum Score"]],
+                     hide_index=True, use_container_width=True)
+
+    st.subheader("📌 MAJORS — nehmi scan (Stage 1 madhe ka nahit te 'Stage1' column madhe)")
+    pin_syms = [p[0] for p in pinned]
+    mj = df[df.Symbol.isin(pin_syms)]
+    if mj.empty:
+        st.info("Majors cha candle data aala nahi. Pudhchya refresh madhe punha tapasa.")
+    else:
+        st.dataframe(mj[["Symbol", "Price", "Stage1", "Signal Dir", "Signal Score", "24h Change %", "State",
+                         "Momentum Dir", "Momentum Score", "DMI", "KST", "VI", "SMC", "SMC Setup", "FINAL"]],
                      hide_index=True, use_container_width=True)
 
     with st.expander("All analyzed symbols (debug)"):
