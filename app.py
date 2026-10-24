@@ -72,7 +72,7 @@ def signal_score(t, turn_pct):
     score = (
         30 * turn_pct
         + 25 * min(1.0, abs(chg24) / 4)
-        + 25 * min(1.0, abs(oi_pct) / 5)
+        + 25 * min(1.0, max(0.0, oi_pct) / 5)
         + (20 if (rng_pos >= 0.8 or rng_pos <= 0.2) else 0)
     )
     if chg24 > 0 and rng_pos >= 0.5:
