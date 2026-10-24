@@ -11,12 +11,12 @@ import streamlit as st
 
 BASE = "https://api.india.delta.exchange"
 S = requests.Session()
-S.headers.update({"Accept": "application/json", "User-Agent": "SamadhanDeltaScanner/4.0"})
+S.headers.update({"Accept": "application/json", "User-Agent": "SamadhanDeltaScanner/5.0"})
 IST = timezone(timedelta(hours=5, minutes=30))
 LOG_FILE = Path(__file__).with_name("signals_log.json")
 
-st.set_page_config(page_title="Samadhan Delta Scanner v4", page_icon="📡", layout="wide")
-st.title("📡 SAMADHAN DELTA SCANNER v4 — SIGNAL ➜ MOMENTUM ➜ SMC/DMI/KST/VI ➜ OI + SAVED SIGNALS")
+st.set_page_config(page_title="Samadhan Delta Scanner v5", page_icon="📡", layout="wide")
+st.title("📡 SAMADHAN DELTA SCANNER v5 — पूर्व-रडार ➜ SIGNAL ➜ MOMENTUM ➜ SMC/DMI/KST/VI ➜ SAVED SIGNALS")
 st.caption("5m candles | Public data only | No auto-orders | Passed signals refresh nantar pan rahatat")
 
 
@@ -62,8 +62,16 @@ with st.sidebar:
         st.session_state["tracked"] = {}
         save_log({})
     st.subheader("Majors (nehmi scan hotat)")
-    pinned_bases = st.multiselect("Pinned coins", ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "AVAX", "LINK"],
+    pinned_bases = st.multiselect("Pinned coins", ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "ADA", "AVAX", "LINK", "BLESS"],
                                   default=["BTC", "ETH", "SOL", "DOGE"])
+    st.subheader("🕵 पूर्व-रडार (शांत माल भरणे)")
+    radar_window = st.slider("इतिहास खिडकी (मिनिटे)", 15, 90, 30, 5)
+    oi_thr = st.slider("OI (contracts) किमान वाढ %", 1.0, 10.0, 3.0, 0.5)
+    pflat = st.slider("किंमत सपाट: जास्तीत जास्त बदल %", 0.2, 1.5, 0.5, 0.1)
+    radar_min = st.slider("किमान Radar score", 30, 90, 55, 5)
+    crowd_thr = st.slider("Funding गर्दी पातळी (±)", 0.02, 0.10, 0.03, 0.01)
+    thin_turnover = st.number_input("पातळ market: 24h turnover खाली ($)", 0, value=500000, step=100000)
+    block_crowd = st.checkbox("गर्दीच्याच बाजूचा signal FINAL मधून काढा", False)
     refresh = st.selectbox("Refresh (seconds)", [30, 60, 90, 120], index=1)
     st.caption("Refresh fakt data cha bhag karto; sidebar settings ani saved signals tashich rahatat.")
 
@@ -222,7 +230,8 @@ def market_snapshot(min_turnover, scan_limit, min_signal, max_move, pinned_bases
         oi_val, oi_chg = f(t, "oi_value_usd"), f(t, "oi_change_usd_6h")
         live[sym] = {"price": f(t, "close", "mark_price"),
                      "oi_pct": oi_chg / oi_val * 100 if oi_val > 0 else 0.0,
-                     "funding": f(t, "funding_rate")}
+                     "funding": f(t, "funding_rate"), "oi_val": oi_val,
+                     "turnover": f(t, "turnover_usd", "turnover", "volume")}
     return signals, len(symbols), len(tickers), len(pool), extended, pinned, missing, live
 
 
@@ -442,6 +451,151 @@ def chip(val, direction):
     return "✅" if (val == direction and direction in ("UP", "DOWN")) else "❌"
 
 
+# ───────────────────────── OI HISTORY + OPERATOR FOOTPRINTS ─────────────────────────
+# Prati scan prati coin cha (vel, price, OI value, funding) lakshat theto (session madhe, max 3 tas).
+# OI "contracts" = oi_value_usd / price  -> price badalla tari OI chi khari vadh dakhavto.
+HIST_KEEP = 3 * 3600
+
+
+def update_history(live):
+    H = st.session_state.setdefault("hist", {})
+    now = time.time()
+    for sym, v in live.items():
+        if v.get("turnover", 0) < min_turnover or v["price"] <= 0 or v.get("oi_val", 0) <= 0:
+            continue
+        dq = H.setdefault(sym, [])
+        if dq and now - dq[-1][0] < 10:
+            continue
+        dq.append((now, v["price"], v["oi_val"], v["funding"]))
+        while dq and now - dq[0][0] > HIST_KEEP:
+            dq.pop(0)
+
+
+def footprint(sym, window_min=None):
+    """Operator chya pavlakhuna (andaaz). Janeevar kami data asel tar None."""
+    window_min = window_min or radar_window
+    H = st.session_state.get("hist", {}).get(sym)
+    if not H or len(H) < 4:
+        return None
+    t_end = H[-1][0]
+    pts = [p for p in H if t_end - p[0] <= window_min * 60]
+    if len(pts) < 4:
+        return None
+    minutes = (pts[-1][0] - pts[0][0]) / 60
+    if minutes < max(5.0, window_min * 0.5):
+        return None
+    ct = [p[2] / p[1] for p in pts]                      # OI contracts
+    steps = [ct[i] - ct[i - 1] for i in range(1, len(ct))]
+    persistence = sum(1 for x in steps if x > 0) / len(steps)
+    oi_gain = (ct[-1] / ct[0] - 1) * 100 if ct[0] > 0 else 0.0
+    prices = [p[1] for p in pts]
+    price_chg = pct(prices[-1], prices[0])
+    hi_p, lo_p = max(prices), min(prices)
+    rng_pct = (hi_p / lo_p - 1) * 100 if lo_p > 0 else 0.0
+    pos = (prices[-1] - lo_p) / (hi_p - lo_p) if hi_p > lo_p else 0.5
+
+    adds = [(pts[i][1], steps[i - 1]) for i in range(1, len(pts)) if steps[i - 1] > 0]
+    wsum = sum(w for _, w in adds)
+    avg = lo = hi = None
+    if wsum > 0:
+        avg = sum(pr * w for pr, w in adds) / wsum
+        acc = 0.0
+        for pr, w in sorted(adds):
+            acc += w
+            if lo is None and acc >= 0.1 * wsum:
+                lo = pr
+            if hi is None and acc >= 0.9 * wsum:
+                hi = pr
+    bias = "वरचा झुकाव (कमकुवत)" if pos > 0.6 else ("खालचा झुकाव (कमकुवत)" if pos < 0.4 else "दिशा अज्ञात")
+    return {"minutes": minutes, "oi_gain": oi_gain, "persistence": persistence, "price_chg": price_chg,
+            "rng_pct": rng_pct, "pos": pos, "entry_avg": avg, "entry_lo": lo, "entry_hi": hi,
+            "bias": bias, "funding": pts[-1][3], "price": prices[-1]}
+
+
+def risk_flags(v):
+    out = []
+    fnd = v.get("funding", 0.0)
+    if fnd >= crowd_thr:
+        out.append(f"⚠ लाँगची गर्दी (funding {fnd:.3f})")
+    elif fnd <= -crowd_thr:
+        out.append(f"⚠ शॉर्टची गर्दी (funding {fnd:.3f})")
+    tv = v.get("turnover", 0.0)
+    if tv < thin_turnover:
+        out.append(f"⚠ पातळ market (turnover ${tv:,.0f})")
+    return out
+
+
+def fp_text(sym, live):
+    v = live.get(sym, {})
+    fp = footprint(sym)
+    parts = []
+    if fp:
+        parts.append(f"OI {fp['oi_gain']:+.1f}% / किंमत {fp['price_chg']:+.2f}% ({fp['minutes']:.0f} मि)")
+        if fp["entry_avg"]:
+            parts.append(f"अंदाजे भरणा ~{fp['entry_avg']:.6g}")
+    else:
+        parts.append("इतिहास कमी")
+    parts += risk_flags(v)
+    return " | ".join(parts)
+
+
+def radar_score(fp, vr):
+    oi_s = 30 * min(1.0, max(0.0, fp["oi_gain"]) / (2 * oi_thr))
+    flat_s = 20 * max(0.0, 1 - abs(fp["price_chg"]) / pflat)
+    pers_s = 10 * min(1.0, max(0.0, (fp["persistence"] - 0.4) / 0.4))
+    af = abs(fp["funding"])
+    fund_s = 15 if af <= 0.02 else (7 if af < crowd_thr else 0)
+    vol_s = 20 * min(1.0, max(0.0, (vr - 1.0) / 1.0)) if vr else 0
+    return round(oi_s + flat_s + pers_s + fund_s + vol_s, 1)
+
+
+def radar_volume_ratio(sym):
+    try:
+        d = candles(sym, "5m", 80)
+        if len(d) < 40:
+            return None
+        v = d.volume.fillna(0)
+        base = float(v.iloc[-46:-6].median())
+        return float(v.iloc[-6:].mean()) / base if base > 0 else None
+    except Exception:
+        return None
+
+
+def compute_radar(live, limit=8):
+    """Sagle coins madhun: OI vadhat ahe + kimat sapat + funding shant (gardi nahi)."""
+    cands = []
+    for sym, v in live.items():
+        if v.get("turnover", 0) < min_turnover:
+            continue
+        fp = footprint(sym)
+        if not fp:
+            continue
+        if fp["oi_gain"] >= oi_thr and abs(fp["price_chg"]) <= pflat and abs(fp["funding"]) < crowd_thr:
+            cands.append((sym, fp))
+    cands.sort(key=lambda x: x[1]["oi_gain"], reverse=True)
+    cands = cands[:limit]
+    rows = []
+    if cands:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            vrs = list(ex.map(lambda c: radar_volume_ratio(c[0]), cands))
+        for (sym, fp), vr in zip(cands, vrs):
+            sc = radar_score(fp, vr)
+            if sc < radar_min:
+                continue
+            flags = risk_flags(live[sym])
+            rows.append({
+                "Symbol": sym, "Radar Score": sc, "OI वाढ %": round(fp["oi_gain"], 2),
+                "किंमत %": round(fp["price_chg"], 2), "Volume x": round(vr, 2) if vr else None,
+                "Funding": fp["funding"], "OI सातत्य": f'{fp["persistence"] * 100:.0f}%',
+                "अंदाजे भरणा (सरासरी)": fp["entry_avg"],
+                "भरणा पट्टा": f'{fp["entry_lo"]:.6g} – {fp["entry_hi"]:.6g}' if fp["entry_lo"] else "—",
+                "आत्ताची किंमत": fp["price"], "झुकाव": fp["bias"],
+                "इशारे": "; ".join(flags) if flags else "—", "मिनिटे": round(fp["minutes"]),
+            })
+    rows.sort(key=lambda r: r["Radar Score"], reverse=True)
+    return rows
+
+
 # ───────────────────────── TRACKER (saved signals) ─────────────────────────
 def update_tracker(df, live):
     T = st.session_state["tracked"]
@@ -488,6 +642,21 @@ def render_tracker(T):
     if not T:
         st.info("Ajun ekahi signal FINAL zala nahi. FINAL zalyavar to ithe save hoil.")
         return
+    closed = [v for v in T.values() if v["status"] in ("TP HIT", "SL HIT")]
+    wins = [v for v in closed if v["status"] == "TP HIT"]
+    n_active = sum(1 for v in T.values() if v["status"] == "ACTIVE")
+    n_exp = sum(1 for v in T.values() if v["status"] == "EXPIRED")
+    breakeven = sl_atr / (sl_atr + tp_atr) * 100      # fees/slippage dhartaa nahi
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("ACTIVE", n_active)
+    c2.metric("TP / SL", f"{len(wins)} / {len(closed) - len(wins)}")
+    c3.metric("Win rate", f"{len(wins) / len(closed) * 100:.0f}%" if closed else "—")
+    c4.metric("Avg P/L (closed)",
+              f"{sum(v['pnl'] for v in closed) / len(closed):.2f}%" if closed else "—")
+    c5.metric("Breakeven win rate", f"{breakeven:.0f}%")
+    if len(closed) < 30:
+        st.caption(f"फक्त {len(closed)} closed सिग्नल आहेत (EXPIRED {n_exp} मोजले नाहीत). "
+                   f"30+ होईपर्यंत win rate वर विश्वास ठेवू नका.")
     now = time.time()
     rows = []
     for v in sorted(T.values(), key=lambda x: x["t"], reverse=True):
@@ -514,6 +683,7 @@ def scan_view():
             signals, n_products, n_tickers, n_pool, n_ext, pinned, missing, live = market_snapshot(
                 min_turnover, scan_limit, min_signal, max_move, tuple(pinned_bases))
 
+        update_history(live)
         st.caption(f"Last scan: {datetime.now(IST).strftime('%H:%M:%S IST')} | Products: {n_products} | "
                    f"Tickers: {n_tickers} | Turnover pass: {n_pool} | Aadhi move zalele (kadhle): {n_ext} | "
                    f"Early signal stocks: {len(signals)}")
@@ -527,6 +697,21 @@ def scan_view():
                                  "Funding", "Turnover"]], hide_index=True, use_container_width=True)
         else:
             st.info("Stage 1 madhe ekahi early signal nahi.")
+
+        st.subheader("🕵 पूर्व-रडार — शांत माल भरणे (breakout च्या आधी)")
+        n_hist = len(st.session_state.get("hist", {}))
+        try:
+            radar_rows = compute_radar(live)
+        except Exception as ex_:
+            radar_rows = []
+            st.warning(f"Radar त्रुटी: {ex_}")
+        if radar_rows:
+            st.dataframe(pd.DataFrame(radar_rows), hide_index=True, use_container_width=True)
+            st.caption("ही यादी 'काहीतरी जमत आहे' एवढेच सांगते, दिशा नाही. Breakout (FRESH) झाल्यावरच FINAL चे नियम लागतात. "
+                       "'अंदाजे भरणा' = ज्या किमतींवर OI वाढला त्यांची OI-वजनाची सरासरी; ऑपरेटरची खरी entry नाही.")
+        else:
+            st.info(f"आत्ता पूर्व-रडारवर कोणीही नाही. ({n_hist} coins चा इतिहास जमा; "
+                    f"{radar_window} मिनिटांचा डेटा जमायला ॲप चालू ठेवा.)")
 
         done = {s[0] for s in signals}
         todo = list(signals) + [p for p in pinned if p[0] not in done]
@@ -542,6 +727,13 @@ def scan_view():
                     progress.progress(i / len(jobs))
             progress.empty()
         df = pd.DataFrame(rows)
+
+        if not df.empty:
+            df["Footprint"] = df.Symbol.map(lambda x: fp_text(x, live))
+            if block_crowd:
+                crowded = ((df.FINAL == "UP") & (df.Funding >= crowd_thr)) | \
+                          ((df.FINAL == "DOWN") & (df.Funding <= -crowd_thr))
+                df.loc[crowded, "FINAL"] = "NO"
 
         T = update_tracker(df, live)      # navin FINAL save kara, junyanchi live price/SL/TP update kara
 
@@ -576,6 +768,12 @@ def scan_view():
                         st.write(f'Price: **{r.Price}** · 24h: **{r["24h Change %"]:.2f}%** · '
                                  f'Extension: **{r["Extension (ATR)"]:.1f} ATR**')
                         st.caption(r.Reason)
+                        st.write(f'🕵 **पाऊलखुणा:** {r["Footprint"]}')
+                        _fl = risk_flags(live.get(r.Symbol, {}))
+                        if (r.FINAL == "UP" and r.Funding >= crowd_thr) or (r.FINAL == "DOWN" and r.Funding <= -crowd_thr):
+                            st.warning("⚠ तुमच्या बाजूला गर्दी आहे (funding). उलट झटका (squeeze) शक्य; SL नक्की लावा.")
+                        if any("पातळ" in x for x in _fl):
+                            st.warning("⚠ पातळ market: spread/slippage जास्त, किंमत सहज हलते. Leverage कमी ठेवा.")
 
         render_tracker(T)
 
@@ -585,7 +783,8 @@ def scan_view():
                 st.info("Ata kahi nahi.")
             else:
                 st.dataframe(near[["Symbol", "State", "Signal Dir", "Momentum Dir", "Confirms", "DMI", "KST", "VI",
-                                   "SMC", "OI", "OI Meaning", "SMC Setup", "Signal Score", "Momentum Score"]],
+                                   "SMC", "OI", "OI Meaning", "SMC Setup", "Funding", "Footprint", "Signal Score",
+                                   "Momentum Score"]],
                              hide_index=True, use_container_width=True)
 
             st.subheader("📌 MAJORS — nehmi scan (Stage 1 madhe ka nahit te 'Stage1' column madhe)")
@@ -596,7 +795,7 @@ def scan_view():
             else:
                 st.dataframe(mj[["Symbol", "Price", "Stage1", "Signal Dir", "Signal Score", "24h Change %", "State",
                                  "Momentum Dir", "Momentum Score", "DMI", "KST", "VI", "SMC", "OI Meaning",
-                                 "SMC Setup", "FINAL"]], hide_index=True, use_container_width=True)
+                                 "SMC Setup", "Funding", "Footprint", "FINAL"]], hide_index=True, use_container_width=True)
 
             with st.expander("All analyzed symbols (debug)"):
                 st.dataframe(df.sort_values(["FINAL", "Confirms", "Momentum Score"], ascending=False),
