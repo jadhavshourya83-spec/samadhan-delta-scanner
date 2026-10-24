@@ -116,7 +116,7 @@ def analyze(symbol, ticker, threshold):
         dn = (25 if downtrend else 0) + (25 if downbreak else 0) + (20 if vr >= 1.5 and chg3 < 0 else 0) + (15 if chg6 < -.15 else 0) + (10 if price < e20.iloc[-1] else 0)
         oi = f(ticker, "open_interest", "oi")
         confirmed = "UP" if up >= threshold and up > dn else ("DOWN" if dn >= threshold and dn > up else "WAIT")
-        return {"Symbol":symbol,"Price":price,"Early Watch":early,"Activity Score":min(100,max(0,max(early_up,early_dn)*20+(10 if oi else 0)+(10 if vr>=1.5 else 0)),
+                return {"Symbol":symbol,"Price":price,"Early Watch":early,"Activity Score":min(100,max(0,max(early_up,early_dn)*20+(10 if oi else 0)+(10 if vr>=1.5 else 0))),
                 "Confirmed":confirmed,"Momentum Score":max(up,dn),"5m Change %":chg3,"Volume x Median":vr,
                 "OI available":"Yes" if oi else "No","Reason":f"EMA20/50 {'UP' if uptrend else 'DOWN' if downtrend else 'FLAT'}; breakout {'UP' if upbreak else 'DOWN' if downbreak else 'NO'}; volume {vr:.2f}x"}
     except Exception:
