@@ -103,14 +103,14 @@ def pct(now, before):
 # |OI| < 0.5% kinva |price| < 0.2% = anischit (NEUTRAL)
 def oi_meaning(price_chg, oi_pct):
     if abs(oi_pct) < 0.5 or abs(price_chg) < 0.2:
-        return "-", "⚪ OI flat / anischit"
+        return "-", "⚪ OI स्थिर / अनिश्चित"
     if price_chg > 0 and oi_pct > 0:
-        return "UP", "🟢 Long build-up (nave buyers, move mazboot)"
+        return "UP", "🟢 लाँग बिल्ड-अप (नवे खरेदीदार, तेजी मजबूत)"
     if price_chg > 0 and oi_pct < 0:
-        return "-", "🟡 Short covering (shorts band, move kamjor)"
+        return "-", "🟡 शॉर्ट कव्हरिंग (शॉर्ट बंद होत आहेत, तेजी कमकुवत)"
     if price_chg < 0 and oi_pct > 0:
-        return "DOWN", "🔴 Short build-up (nave sellers, move mazboot)"
-    return "-", "🟠 Long unwinding (longs bahar, kamjor)"
+        return "DOWN", "🔴 शॉर्ट बिल्ड-अप (नवे विक्रेते, घसरण मजबूत)"
+    return "-", "🟠 लाँग अनवाइंडिंग (लाँग बाहेर पडत आहेत, घसरण कमकुवत)"
 
 
 # ───────────────────────── STAGE 1 : EARLY SIGNAL ─────────────────────────
@@ -602,14 +602,15 @@ def scan_view():
                 st.dataframe(df.sort_values(["FINAL", "Confirms", "Momentum Score"], ascending=False),
                              hide_index=True, use_container_width=True)
 
-        with st.expander("ℹ OI kasa vachaycha"):
+        with st.expander("ℹ OI कसा वाचायचा"):
             st.markdown(
-                "- 🟢 **Price ↑ + OI ↑ = Long build-up:** nave buyers ale, move mazboot\n"
-                "- 🟡 **Price ↑ + OI ↓ = Short covering:** shorts band hot ahet, move kamjor\n"
-                "- 🔴 **Price ↓ + OI ↑ = Short build-up:** nave sellers ale, move mazboot\n"
-                "- 🟠 **Price ↓ + OI ↓ = Long unwinding:** longs bahar padat ahet, move kamjor\n"
-                "- ⚪ OI 0.5% peksha kami kinva price 0.2% peksha kami badlala = anischit\n\n"
-                "Price ani OI doghanche 6 tasacha badal vaparle ahet.")
+                "**OI (Open Interest)** म्हणजे बाजारात सध्या उघडे असलेले एकूण सौदे. OI वाढला = नवीन पैसा येत आहे; OI कमी झाला = सौदे बंद होत आहेत.\n\n"
+                "- 🟢 **किंमत ↑ + OI ↑ = लाँग बिल्ड-अप:** नवीन खरेदीदार आले आहेत, तेजी मजबूत\n"
+                "- 🟡 **किंमत ↑ + OI ↓ = शॉर्ट कव्हरिंग:** शॉर्ट विक्रेते सौदे बंद करत आहेत, नवीन खरेदीदार नाहीत, तेजी कमकुवत\n"
+                "- 🔴 **किंमत ↓ + OI ↑ = शॉर्ट बिल्ड-अप:** नवीन विक्रेते आले आहेत, घसरण मजबूत\n"
+                "- 🟠 **किंमत ↓ + OI ↓ = लाँग अनवाइंडिंग:** लाँग घेतलेले लोक बाहेर पडत आहेत, नवीन विक्रेते नाहीत, घसरण कमकुवत\n"
+                "- ⚪ OI 0.5% पेक्षा कमी किंवा किंमत 0.2% पेक्षा कमी बदलली = अनिश्चित, स्पष्ट संकेत नाही\n\n"
+                "किंमत आणि OI दोन्हींचा गेल्या 6 तासांचा बदल वापरला आहे.")
 
         st.info("SMC ani indicator crosses rule-based approximations ahet; future predict hot nahi. "
                 "Real paisa lavnyaadhi paper-trade ani backtest kara. Orders place hot nahit.")
