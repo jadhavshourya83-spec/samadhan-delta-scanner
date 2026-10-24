@@ -561,6 +561,66 @@ def radar_volume_ratio(sym):
         return None
 
 
+def taker_flow(sym, window_min=None):
+    """Public trades madhun: kon bhav olandun (taker) ghet hota. Rakane auto-olakhto; na sapadle tar karan dakhavto."""
+    window_min = window_min or radar_window
+    diag = st.session_state.setdefault("taker_diag", {})
+    try:
+        rows = get(f"/v2/trades/{sym}")
+    except Exception as ex_:
+        diag[sym] = f"trades API cha call fail: {ex_}"
+        return {"ok": False}
+    if isinstance(rows, dict):
+        rows = rows.get("trades") or rows.get("result") or []
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        diag[sym] = "trades rikame / vegla format"
+        return {"ok": False}
+    diag[sym] = "पहिला trade (रकाने तपासा): " + str({k: rows[0][k] for k in list(rows[0])[:10]})
+    now, buy, sell, ts = time.time(), 0.0, 0.0, []
+    for r in rows:
+        size = f(r, "size", "quantity", "volume")
+        if size <= 0:
+            continue
+        t = f(r, "timestamp", default=0.0)
+        if t > 1e17:
+            t /= 1e9
+        elif t > 1e14:
+            t /= 1e6
+        elif t > 1e11:
+            t /= 1e3
+        if t and now - t > window_min * 60:
+            continue
+        br, sr = str(r.get("buyer_role", "")).lower(), str(r.get("seller_role", "")).lower()
+        sd = str(r.get("side", "")).lower()
+        if br == "taker":
+            buy += size
+        elif sr == "taker":
+            sell += size
+        elif sd == "buy":
+            buy += size
+        elif sd == "sell":
+            sell += size
+        else:
+            continue
+        if t:
+            ts.append(t)
+    tot = buy + sell
+    if tot <= 0:
+        diag[sym] += " | taker/side रकाना सापडला नाही किंवा खिडकीत trade नाहीत"
+        return {"ok": False}
+    return {"ok": True, "buy_share": buy / tot, "minutes": (now - min(ts)) / 60 if ts else None}
+
+
+def absorption(price_chg, buy_share):
+    if abs(price_chg) > pflat:
+        return "किंमत आधीच हलली"
+    if buy_share <= 0.40:
+        return "🟢 शांत खरेदी शोषण (विक्री घाईची, किंमत टिकली)"
+    if buy_share >= 0.60:
+        return "🔴 शांत विक्री शोषण (खरेदी घाईची, किंमत अडली)"
+    return "⚪ संतुलित"
+
+
 def compute_radar(live, limit=8):
     """Sagle coins madhun: OI vadhat ahe + kimat sapat + funding shant (gardi nahi)."""
     cands = []
@@ -577,8 +637,8 @@ def compute_radar(live, limit=8):
     rows = []
     if cands:
         with ThreadPoolExecutor(max_workers=4) as ex:
-            vrs = list(ex.map(lambda c: radar_volume_ratio(c[0]), cands))
-        for (sym, fp), vr in zip(cands, vrs):
+            vrs = list(ex.map(lambda c: (radar_volume_ratio(c[0]), taker_flow(c[0])), cands))
+        for (sym, fp), (vr, tf) in zip(cands, vrs):
             sc = radar_score(fp, vr)
             if sc < radar_min:
                 continue
@@ -590,6 +650,8 @@ def compute_radar(live, limit=8):
                 "अंदाजे भरणा (सरासरी)": fp["entry_avg"],
                 "भरणा पट्टा": f'{fp["entry_lo"]:.6g} – {fp["entry_hi"]:.6g}' if fp["entry_lo"] else "—",
                 "आत्ताची किंमत": fp["price"], "झुकाव": fp["bias"],
+                "Taker खरेदी %": round(tf["buy_share"] * 100) if tf["ok"] else None,
+                "शोषण": absorption(fp["price_chg"], tf["buy_share"]) if tf["ok"] else "taker डेटा नाही",
                 "इशारे": "; ".join(flags) if flags else "—", "मिनिटे": round(fp["minutes"]),
             })
     rows.sort(key=lambda r: r["Radar Score"], reverse=True)
@@ -707,11 +769,21 @@ def scan_view():
             st.warning(f"Radar त्रुटी: {ex_}")
         if radar_rows:
             st.dataframe(pd.DataFrame(radar_rows), hide_index=True, use_container_width=True)
+            st.caption("Taker खरेदी % = भाव ओलांडून (घाईत) घेणाऱ्यांमध्ये खरेदीदारांचा वाटा. किंमत सपाट + विक्री घाईची = कोणीतरी शांतपणे घेत असू शकतो; "
+                       "उलट असेल तर शांतपणे विकत असू शकतो. हा अंदाज आहे, ओळख नाही.")
             st.caption("ही यादी 'काहीतरी जमत आहे' एवढेच सांगते, दिशा नाही. Breakout (FRESH) झाल्यावरच FINAL चे नियम लागतात. "
                        "'अंदाजे भरणा' = ज्या किमतींवर OI वाढला त्यांची OI-वजनाची सरासरी; ऑपरेटरची खरी entry नाही.")
         else:
             st.info(f"आत्ता पूर्व-रडारवर कोणीही नाही. ({n_hist} coins चा इतिहास जमा; "
                     f"{radar_window} मिनिटांचा डेटा जमायला ॲप चालू ठेवा.)")
+
+        with st.expander("🔧 Taker डेटा तपासणी (trades रकाने बरोबर वाचले का)"):
+            dg = st.session_state.get("taker_diag", {})
+            if dg:
+                for k_, v_ in list(dg.items())[-6:]:
+                    st.write(f"**{k_}:** {v_}")
+            else:
+                st.caption("अजून taker डेटा मागवला नाही (रडारवर coin आला की मागवला जाईल).")
 
         done = {s[0] for s in signals}
         todo = list(signals) + [p for p in pinned if p[0] not in done]
@@ -769,6 +841,12 @@ def scan_view():
                                  f'Extension: **{r["Extension (ATR)"]:.1f} ATR**')
                         st.caption(r.Reason)
                         st.write(f'🕵 **पाऊलखुणा:** {r["Footprint"]}')
+                        _tf = taker_flow(r.Symbol)
+                        if _tf["ok"]:
+                            st.write(f'⚖ **Taker खरेदी:** {_tf["buy_share"] * 100:.0f}% (उरलेले विक्री) · '
+                                     f'{absorption(r["15m Change %"], _tf["buy_share"])}')
+                        else:
+                            st.caption("Taker डेटा मिळाला नाही (वरची 'Taker डेटा तपासणी' पहा).")
                         _fl = risk_flags(live.get(r.Symbol, {}))
                         if (r.FINAL == "UP" and r.Funding >= crowd_thr) or (r.FINAL == "DOWN" and r.Funding <= -crowd_thr):
                             st.warning("⚠ तुमच्या बाजूला गर्दी आहे (funding). उलट झटका (squeeze) शक्य; SL नक्की लावा.")
