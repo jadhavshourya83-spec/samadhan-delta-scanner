@@ -54,6 +54,8 @@ with st.sidebar:
     req_vi = st.checkbox("Vortex cross required (VI+ / VI-)", True)
     req_smc = st.checkbox("SMC required (BOS/CHoCH + sweep ya FVG)", True)
     req_oi = st.checkbox("OI direction la support karto (build-up) required", False)
+    min_conf = st.slider("ticked पैकी किमान किती पुष्टी जुळाव्यात (0 = सगळ्या)", 0, 5, 0, 1,
+                         help="सगळ्या पुष्टी एकत्र जुळणे दुर्मिळ आहे. 3 केल्यास ticked पैकी कोणत्याही 3 जुळल्या तरी चालेल.")
     st.subheader("Saved signals (paper-trade)")
     sl_atr = st.slider("Stop-loss = kiti ATR", 0.5, 3.0, 1.5, 0.25)
     tp_atr = st.slider("Target = kiti ATR", 1.0, 6.0, 3.0, 0.5)
@@ -76,7 +78,8 @@ with st.sidebar:
     st.caption("Refresh fakt data cha bhag karto; sidebar settings ani saved signals tashich rahatat.")
 
 CFG = {"cross_n": cross_n, "adx_min": adx_min,
-       "req": {"DMI": req_dmi, "KST": req_kst, "VI": req_vi, "SMC": req_smc, "OI": req_oi}}
+       "req": {"DMI": req_dmi, "KST": req_kst, "VI": req_vi, "SMC": req_smc, "OI": req_oi},
+       "min_conf": min_conf}
 
 
 def get(path, params=None):
@@ -422,7 +425,9 @@ def momentum(symbol, sig, threshold, cfg):
         oi_dir, oi_text = oi_meaning(chg6h, sig["OI Change 6h %"])
         conf = {"DMI": dmi_dir, "KST": kst_dir, "VI": vi_dir, "SMC": smc_dir, "OI": oi_dir}
         required = [k for k, v in cfg["req"].items() if v]
-        confirms_ok = all(conf[k] == mom_dir for k in required) if mom_dir != "WAIT" else False
+        matched = sum(1 for k in required if conf[k] == mom_dir)
+        need = len(required) if cfg.get("min_conf", 0) <= 0 else min(cfg["min_conf"], len(required))
+        confirms_ok = (matched >= need) if (mom_dir != "WAIT" and required) else False
 
         base_ok = state == "FRESH" and mom_dir != "WAIT" and mom_dir == sig["Signal Dir"] \
             and sig.get("Stage1 Status") == "PASS"
@@ -852,6 +857,40 @@ def scan_view():
                             st.warning("⚠ तुमच्या बाजूला गर्दी आहे (funding). उलट झटका (squeeze) शक्य; SL नक्की लावा.")
                         if any("पातळ" in x for x in _fl):
                             st.warning("⚠ पातळ market: spread/slippage जास्त, किंमत सहज हलते. Leverage कमी ठेवा.")
+
+        if not df.empty:
+            with st.expander("🔬 गाळणी फनेल — signal कुठे अडतो?", expanded=True):
+                n1 = len(signals)
+                fresh = df[(df.Stage1 == "PASS") & (df.State == "FRESH")]
+                aligned = fresh[(fresh["Momentum Dir"] != "WAIT") & (fresh["Momentum Dir"] == fresh["Signal Dir"])]
+                req_list = [k for k, on in (("DMI", req_dmi), ("KST", req_kst), ("VI", req_vi),
+                                            ("SMC", req_smc), ("OI", req_oi)) if on]
+                st.write(f"1️⃣ बाजारातील coins (turnover पास): **{n_pool}** → आधीच जास्त हलले (काढले): **{n_ext}**")
+                st.write(f"2️⃣ Stage 1 पास (early signal): **{n1}**")
+                st.write(f"3️⃣ त्यातले FRESH breakout (गेल्या 3 candle मध्ये): **{len(fresh)}**")
+                st.write(f"4️⃣ Momentum दिशा = Signal दिशा: **{len(aligned)}**")
+                if len(aligned):
+                    cnt = {k: int((aligned[k] == aligned["Momentum Dir"]).sum()) for k in req_list}
+                    st.write("5️⃣ या " + str(len(aligned)) + " पैकी प्रत्येक पुष्टी किती coins मध्ये जुळली: " +
+                             " · ".join(f"**{k}** {v}" for k, v in cnt.items()))
+                st.write(f"🏁 FINAL: **{len(df[df.FINAL.isin(['UP', 'DOWN'])])}**")
+                worst = None
+                if n1 == 0:
+                    worst = "Stage 1 मध्येच सगळे गळतात. 'Max 24h move' वाढवा (7) किंवा 'Minimum SIGNAL score' कमी करा (45)."
+                elif len(fresh) == 0:
+                    worst = "Stage 1 पास coins मध्ये कोणाचाही breakout ताजा नाही (किंवा EXTENDED). बाजार शांत असेल तर हे सामान्य आहे."
+                elif len(aligned) == 0:
+                    worst = "Breakout आहे, पण Stage 1 आणि Momentum च्या दिशा विरुद्ध आहेत."
+                elif len(df[df.FINAL.isin(["UP", "DOWN"])]) == 0:
+                    worst = ("Breakout आणि दिशा जुळतात, पण पुष्टी (DMI/KST/VI/SMC) सगळ्या एकत्र जुळत नाहीत. "
+                             "Sidebar मध्ये 'किमान पुष्टी' 3 करून पहा, किंवा सर्वात कमी जुळणारी पुष्टी बंद करा.")
+                if worst:
+                    st.info("👉 अडथळा: " + worst)
+                near1 = aligned[aligned.Confirms >= max(1, len(req_list) - 1)].sort_values("Confirms", ascending=False)
+                if len(near1) and df[df.FINAL.isin(["UP", "DOWN"])].empty:
+                    st.write("**अगदी जवळचे (FINAL साठी एक पुष्टी कमी):**")
+                    st.dataframe(near1[["Symbol", "Momentum Dir", "Confirms", "DMI", "KST", "VI", "SMC", "OI"]],
+                                 hide_index=True, use_container_width=True)
 
         render_tracker(T)
 
