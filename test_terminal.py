@@ -265,4 +265,22 @@ c_bad = {"strike": 25100.0, "side": "ce", "spot": 25200.0}                      
 r_bad = L.cas_spread(c_bad, mk_oc(25000.0), 50, 65, 1500000, 1.0, cf)
 assert not r_bad["ok"] and any("breakeven" in i for i in r_bad["issues"]), r_bad
 print("15 OK regression: spot per-index, ITM nako, breakeven check")
+# 16) spot-neutral premium: spot khali gela, PE premium delta pramane vadhla -> flow nahi (noise)
+stN = {}
+kk = L.flow_key("NIFTY", "e", 25000, "pe")
+for i in range(0, 420, 30):
+    spot_i = 25000 - i * 0.5                      # spot 210 pt khali
+    ltp_i = 100 + 0.5 * (25000 - spot_i)          # PE delta -0.5 => premium +0.5 x spot padzad
+    L.flow_update(stN, kk, 7000 + i, ltp_i, 1000000 * (1 + 0.012 * i / 420), 1000, 12, spot_i, -0.5)
+mN = L.flow_metrics(stN[kk], 5.0)
+assert mN["prem_raw"] > 5 and abs(mN["prem_pct"]) < 0.5, mN
+# ani kharya PE long build-up (premium delta peksha jast vadhla) -> ajun disto
+stP = {}
+for i in range(0, 420, 30):
+    spot_i = 25000 - i * 0.5
+    ltp_i = 100 + 0.5 * (25000 - spot_i) + i * 0.15
+    L.flow_update(stP, kk, 7000 + i, ltp_i, 1000000 * (1 + 0.05 * i / 420), 1000, 12, spot_i, -0.5)
+mP = L.flow_metrics(stP[kk], 5.0)
+assert mP["prem_pct"] > mN["prem_pct"] + 3, (mP, mN)
+print("16 OK spot-neutral premium: kaccha", round(mN["prem_raw"], 1), "% -> spot vagalun", round(mN["prem_pct"], 2), "%")
 print("\nSAGLYA CHACHNYA PASS")
