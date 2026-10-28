@@ -193,7 +193,7 @@ def scenario(side, spot_drift_pct=0.0, prem_drop=0.04, oi_rise=0.06, burst=True)
         vol = i * 10 + (60 * (i - 420) if (burst and i >= 420) else 0)
         L.flow_update(st3, L.flow_key("NIFTY", "e", 25100 if side == "ce" else 24900, side), ts, ltp, oi, vol)
         sp = base_spot * (1 + spot_drift_pct / 100 * f)
-        st3.setdefault("__spot__", []).append((ts, sp))
+        st3.setdefault("__spot__NIFTY", []).append((ts, sp))
     return st3, base_spot * (1 + spot_drift_pct / 100)
 
 def mk_oc(spot):
@@ -251,4 +251,18 @@ for i in range(0, 1800, 30):
 mv = L.flow_metrics(stv["x"], 5.0)
 assert mv["vol_ratio"] and 2.4 < mv["vol_ratio"] < 2.8, mv   # adhicha saravaasari veg 16/s, ata 40/s
 print("14 OK volume ratio:", round(mv["vol_ratio"], 2))
+# 15) regression: spot itihas index pramane vegla; ITM sell nahi; breakeven spot chya aat nasava
+stX = {}
+for i in range(0, 300, 30):
+    L.flow_ingest(stX, "NIFTY", "e", {}, 25000.0, L.Cfg(), 50, 100 + i)
+    L.flow_ingest(stX, "SENSEX", "e", {}, 73000.0, L.Cfg(), 100, 100 + i)
+assert abs(L.spot_move_pct(stX, 3, "SENSEX") or 0) < 0.01 and abs(L.spot_move_pct(stX, 3, "NIFTY") or 0) < 0.01
+stX.setdefault("__spot__BAD", []).extend([(1, 1.0), (2, 1.0), (400, 2.0)])
+assert L.spot_move_pct(stX, 3, "BAD") is None                      # 100% jump = data chukicha
+oc_itm = mk_oc(25000.0)
+assert not [x for x in L.cas_detect(*scenario("ce", 0.0)[:1], "NIFTY", "e", oc_itm, 25400.0, cf, 50) if x["strike"] == 25100]   # 25100 CE ata ITM (spot 25400)
+c_bad = {"strike": 25100.0, "side": "ce", "spot": 25200.0}                                  # breakeven > 25100 pan spot 25200 chya khali
+r_bad = L.cas_spread(c_bad, mk_oc(25000.0), 50, 65, 1500000, 1.0, cf)
+assert not r_bad["ok"] and any("breakeven" in i for i in r_bad["issues"]), r_bad
+print("15 OK regression: spot per-index, ITM nako, breakeven check")
 print("\nSAGLYA CHACHNYA PASS")
