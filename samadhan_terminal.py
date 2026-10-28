@@ -49,7 +49,7 @@ class Cfg:
     max_trade_minutes: int = 120
     # OI flow
     flow_window_min: float = 5.0
-    flow_min_score: float = 45.0
+    flow_min_score: float = 35.0
     flow_steps: int = 6
     flow_confirm_min: float = 2.0
     flow_min_ltp: float = 5.0
@@ -414,7 +414,7 @@ def flow_update(store, key, ts, ltp, oi, vol, iv=0.0):
 
 
 def flow_ingest(store, sym, expiry, oc, spot, cfg, step, ts):
-    sh = store.setdefault("__spot__", [])
+    sh = store.setdefault(f"__spot__{sym}", [])
     if spot > 0 and (not sh or ts - sh[-1][0] >= 5):
         sh.append((ts, spot))
         while sh and ts - sh[0][0] > FLOW_KEEP_SEC:
@@ -492,6 +492,7 @@ def flow_score(side, strike, spot, oi_pct, prem_pct, vol_ratio, iv_chg):
                 down += min(oi_s * 1.2, 15) + min(pr_s * 1.6, 20); r_dn.append(txt + " (PE short covering)")
             elif unwind:
                 up += min(oi_s, 12) + min(pr_s * 1.3, 18); r_up.append(txt + " (PE long unwinding)")
+    up, down = up * 2.5, down * 2.5            # 5 minitachya chhotya hallchali sathi (OI 5% + prem 5% ~ 35 gun)
     if vol_ratio is not None and vol_ratio >= 1.5 and up != down:
         bonus = min((vol_ratio - 1.0) * 5, 25)
         if up > down:
@@ -549,9 +550,9 @@ def flow_relation(flow_dir, direction):
 
 
 # ───────── CAS v2: 'move chya aadhi' writers cha radar + sarvottam hedge ─────────
-def spot_move_pct(store, window_min):
+def spot_move_pct(store, window_min, sym=""):
     """Spot ne shevtchya window madhe kiti % halla (+ var / - khali). Itihas kami asel tar None."""
-    sh = store.get("__spot__") or []
+    sh = store.get(f"__spot__{sym}") or []
     if len(sh) < 3:
         return None
     t_now, sp = sh[-1]
@@ -565,7 +566,8 @@ def spot_move_pct(store, window_min):
         if (t_now - sh[0][0]) < 120:
             return None
         ref = sh[0]
-    return (sp - ref[1]) / ref[1] * 100
+    mv = (sp - ref[1]) / ref[1] * 100
+    return mv if abs(mv) <= 5 else None          # 5% peksha jast = data chukicha (index badalla), vaparu naka
 
 
 def cas_detect(store, sym, expiry, oc, spot, cfg, step):
@@ -573,15 +575,15 @@ def cas_detect(store, sym, expiry, oc, spot, cfg, step):
     CE writing = BEARISH (CE strike spot chya vari/javal), PE writing = BULLISH (PE strike spot chya khali/javal).
     Score 0-100:  OI vadh (35) + vegacha vadh/acceleration (15) + premium dabat (20) + volume (15) + spot ajun halla nahi (15).
     Stage: EARLY >= cas_early, STRONG >= cas_strong, LATE = spot aadhich cas_late_pct halla (aata ushir)."""
-    moved_dn = spot_move_pct(store, cfg.cas_long_min)         # spot ne kiti halla (signed)
+    moved_dn = spot_move_pct(store, cfg.cas_long_min, sym)         # spot ne kiti halla (signed)
     out = []
     for strike, node in strike_map(oc).items():
         if abs(strike - spot) > cfg.flow_steps * step:
             continue
         for side in ("ce", "pe"):
-            if side == "ce" and strike < spot - step:          # ITM CE = writers cha vishay nahi
+            if side == "ce" and strike < spot - 0.25 * step:    # ITM nako: sell strike ATM/OTM ch (breakeven spot chya pudhe hava)
                 continue
-            if side == "pe" and strike > spot + step:
+            if side == "pe" and strike > spot + 0.25 * step:
                 continue
             o = (node or {}).get(side) or {}
             ltp, oi = _f(o.get("last_price")), _f(o.get("oi"))
@@ -620,7 +622,7 @@ def cas_detect(store, sym, expiry, oc, spot, cfg, step):
             late = moved is not None and moved >= cfg.cas_late_pct
             stage = "LATE" if late else ("STRONG" if score >= cfg.cas_strong else ("EARLY" if score >= cfg.cas_early else None))
             if stage:
-                out.append({"strike": strike, "side": side, "bias": bias, "stage": stage, "score": score, "ltp": ltp,
+                out.append({"spot": spot, "strike": strike, "side": side, "bias": bias, "stage": stage, "score": score, "ltp": ltp,
                             "oi": oi, "oi_pct": m["oi_pct"], "prem_pct": m["prem_pct"], "vol_ratio": vr,
                             "span_min": m["span_min"], "moved": moved, "reasons": reasons})
     out.sort(key=lambda x: ({"STRONG": 0, "EARLY": 1, "LATE": 2}[x["stage"]], -x["score"]))
@@ -673,6 +675,10 @@ def cas_spread(c, oc, step, lot_size, capital, risk_pct, cfg):
         return {"ok": False, "issues": [f"{m} ({n} strike)" for m, n in why.items()] or ["hedge milala nahi"], "alts": []}
     cands.sort(key=lambda x: (-x["rr"], -x["width"]))
     best = cands[0]
+    be = sell + best["credit"] if side == "ce" else sell - best["credit"]
+    sp0 = c.get("spot")
+    if sp0 and ((side == "ce" and be <= sp0) or (side == "pe" and be >= sp0)):
+        return {"ok": False, "alts": [], "issues": [f"breakeven {be:.0f} spot ({sp0:.0f}) chya aatach: spread aatach tot-sthitit"]}
     return {"ok": True, "issues": [], "side": side, "sell": sell, "sell_px": s_px, "alts": cands[:4],
             "hedge": best["hedge"], "hedge_px": best["hedge_px"], "credit": best["credit"], "width": best["width"],
             "lots": best["lots"], "max_profit": best["max_profit"], "max_loss": best["max_loss"],
@@ -738,7 +744,7 @@ def main():
             max_spread = st.slider("कमाल bid-ask spread %", 0.5, 10.0, 3.0, 0.5)
             use_volume = st.checkbox("Volume फिल्टर (index ला volume नसल्यास वगळला जातो)", True)
             flow_window = st.slider("OI flow window (मिनिटे)", 3, 15, 5, 1)
-            flow_min = st.slider("OI flow किमान score", 30, 80, 45, 5)
+            flow_min = st.slider("OI flow किमान score", 20, 80, 35, 5)
         refresh = st.selectbox("Refresh (सेकंद)", [15, 30, 60], index=1)
         if st.button("🗑 Journal रिकामे करा"):
             st.session_state["journal"] = []
