@@ -404,11 +404,11 @@ def flow_key(sym, expiry, strike, side):
     return f"{sym}|{expiry}|{float(strike):.0f}|{side}"
 
 
-def flow_update(store, key, ts, ltp, oi, vol, iv=0.0):
+def flow_update(store, key, ts, ltp, oi, vol, iv=0.0, spot=0.0, delta=0.0):
     h = store.setdefault(key, [])
     if h and ts - h[-1][0] < 5:
         return
-    h.append((ts, ltp, oi, vol, iv))
+    h.append((ts, ltp, oi, vol, iv, spot, delta))
     while h and ts - h[0][0] > FLOW_KEEP_SEC:
         h.pop(0)
 
@@ -426,15 +426,18 @@ def flow_ingest(store, sym, expiry, oc, spot, cfg, step, ts):
             o = (node or {}).get(side) or {}
             ltp = _f(o.get("last_price"))
             if ltp > 0:
+                dl = abs(_f((o.get("greeks") or {}).get("delta")))
                 flow_update(store, flow_key(sym, expiry, strike, side), ts, ltp, _f(o.get("oi")),
-                            _f(o.get("volume")), _f(o.get("implied_volatility")))
+                            _f(o.get("volume")), _f(o.get("implied_volatility")), spot,
+                            dl if side == "ce" else -dl)
 
 
 def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
     """Kharya velechi window (pratyek 30s nahi). History kami asel tar None."""
     if not h or len(h) < 3:
         return None
-    t_now, ltp, oi, vol, iv = h[-1]
+    t_now, ltp, oi, vol, iv = h[-1][:5]
+    sp_now, dl_now = (h[-1][5], h[-1][6]) if len(h[-1]) >= 7 else (0.0, 0.0)
     target = t_now - window_min * 60
     ref = None
     for s in h:
@@ -450,7 +453,12 @@ def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
     if span_s < 60:
         return None
     oi_pct = (oi - ref[2]) / ref[2] * 100 if ref[2] > 0 else 0.0
-    prem_pct = (ltp - ref[1]) / ref[1] * 100 if ref[1] > 0 else 0.0
+    prem_raw = (ltp - ref[1]) / ref[1] * 100 if ref[1] > 0 else 0.0
+    # SPOT-NEUTRAL premium: spot halla tar premium delta mule apoaap halto (spot khali = PE vadhto). Te vegle kara.
+    prem_pct = prem_raw
+    if len(ref) >= 7 and ref[5] > 0 and sp_now > 0 and ref[6] != 0 and dl_now != 0 and ref[1] > 0:
+        exp_chg = (ref[6] + dl_now) / 2 * (sp_now - ref[5])
+        prem_pct = (ltp - ref[1] - exp_chg) / ref[1] * 100
     iv_chg = (iv - ref[4]) / ref[4] * 100 if (ref[4] > 0 and iv > 0) else 0.0
     new_vol = max(vol - ref[3], 0.0)
     vol_ratio = None
@@ -459,7 +467,7 @@ def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
         base = max(ref[3] - h[0][3], 0.0) / earlier_s * span_s
         if base > 0:
             vol_ratio = new_vol / base
-    return {"oi_pct": oi_pct, "prem_pct": prem_pct, "iv_chg": iv_chg, "new_vol": new_vol,
+    return {"oi_pct": oi_pct, "prem_pct": prem_pct, "prem_raw": prem_raw, "iv_chg": iv_chg, "new_vol": new_vol,
             "vol_ratio": vol_ratio, "span_min": span_s / 60}
 
 
@@ -938,13 +946,36 @@ def main():
         st.subheader("🌊 OI flow (option chain)")
         n_hist = len(st.session_state["flow_store"])
         if flows:
+            atm = round(spot / meta["step"]) * meta["step"]
+            n_up = sum(1 for x in flows if x["direction"] == "UP")
+            n_dn = len(flows) - n_up
+            st.markdown(f"**एकूण कल:** {'🔴 DOWN' if n_dn > n_up else ('🟢 UP' if n_up > n_dn else '⚪ मिश्र')} "
+                        f"(UP {n_up} / DOWN {n_dn}). सगळे एकाच दिशेला असतील तर ते स्पॉट च्या हालचालीचा परिणाम असू शकतो.")
             st.dataframe(pd.DataFrame([{
                 "Strike": f"{x['strike']:.0f} {x['side'].upper()}", "दिशा": x["direction"], "Score": x["score"],
-                f"OI Δ% ({x['span_min']:.0f}मि)": round(x["oi_pct"], 1), "Premium Δ%": round(x["prem_pct"], 1),
+                "घ्यायचे": ("PE" if x["direction"] == "DOWN" else "CE") + f" खरेदी (ATM {atm:.0f})",
+                f"OI Δ% ({x['span_min']:.0f}मि)": round(x["oi_pct"], 1),
+                "Premium Δ% (spot वगळून)": round(x["prem_pct"], 1), "Premium Δ% (कच्चा)": round(x["prem_raw"], 1),
                 "Volume x": round(x["vol_ratio"], 1) if x["vol_ratio"] else None, "OI": f"{x['oi']:,.0f}",
                 "कारण": "; ".join(x["reasons"])} for x in flows[:8]]), hide_index=True, use_container_width=True)
             st.caption(("🔒 सलग " + f"{cfg.flow_confirm_min:.0f}+ मिनिटे तोच top: पुष्टी झाली → " + flow_best["direction"])
                        if flow_ok else "अजून पुष्टी नाही (तोच top candidate सलग 2 मिनिटे हवा). फक्त माहिती; दिशा सिद्ध नाही.")
+            # Flow varun suchavlela strike + yojana (chart signal nasla tari mahiti mhanun)
+            fo = pick_option(oc, spot, flow_best["direction"], meta["step"], cfg,
+                             itm_steps=1 if strike_mode.startswith("1") else 0)
+            if fo["ok"]:
+                fp = trade_plan(fo, sig["atr"], cfg, int(lot_size), float(capital), float(risk_pct))
+                side_txt = "PUT (PE)" if flow_best["direction"] == "DOWN" else "CALL (CE)"
+                if fp["ok"]:
+                    st.info(f"📍 **OI flow नुसार सुचवलेला strike:** {sym} **{fo['strike']:.0f} {side_txt}** खरेदी · "
+                            f"Entry ~₹{fp['entry']} · SL ₹{fp['sl']} · T1 ₹{fp['t1']} · T2 ₹{fp['t2']} · {fp['lots']} lot · "
+                            f"कमाल तोटा ₹{fp['max_loss']:.0f}\n\n"
+                            + ("✅ चार्ट सिग्नल याच दिशेचा आहे." if direction == flow_best["direction"] else
+                               "⚠ चार्ट सिग्नल याच दिशेचा नाही (ENTER नाही). हा फक्त OI चा कल आहे; एकटा आधार म्हणून घेऊ नका."))
+                else:
+                    st.warning(f"OI flow दिशा {flow_best['direction']}, strike {fo['strike']:.0f}: " + (fp.get("note") or "योजना बनत नाही"))
+            else:
+                st.warning(f"OI flow दिशा {flow_best['direction']}, पण option बाद: " + " | ".join(fo["issues"]))
         else:
             st.info(f"OI flow candidate नाही ({n_hist} option चा इतिहास जमा; किमान ~3-5 मिनिटांचा डेटा लागतो).")
 
