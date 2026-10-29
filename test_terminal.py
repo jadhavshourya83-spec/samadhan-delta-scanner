@@ -305,4 +305,13 @@ hc, hp, hfar = (stE2[L.flow_key("NIFTY", "e", 25000, "ce")][0], stE2[L.flow_key(
                 stE2[L.flow_key("NIFTY", "e", 25200, "ce")][0])
 assert abs(hc[6] - 0.5) < 0.01 and abs(hp[6] + 0.5) < 0.01 and 0 < hfar[6] < 0.2, (hc, hp, hfar)
 print("17 OK delta fallback:", round(hc[6], 2), round(hp[6], 2), round(hfar[6], 2))
+# 18) V40 signal -> plan (OTM, kami delta chalto); strike chain madhe nasel tar nakar
+oc18 = mk_oc(25000.0)
+for k_ in oc18: 
+    oc18[k_]["ce"]["greeks"] = {"delta": 0.2}
+v1 = L.v40_plan({"type": "CE", "strike": 25100}, oc18, 40.0, L.Cfg(), 65, 1500000, 1.0, 50)
+assert v1["ok"] and v1["opt"]["strike"] == 25100 and v1["plan"]["lots"] >= 1 and v1["plan"]["sl"] < v1["plan"]["entry"] < v1["plan"]["t1"], v1
+v2 = L.v40_plan({"type": "CE", "strike": 99999}, oc18, 40.0, L.Cfg(), 65, 1500000, 1.0, 50)
+assert not v2["ok"] and "chain" in v2["note"], v2
+print("18 OK V40 plan:", v1["opt"]["strike"], v1["plan"]["entry"], v1["plan"]["sl"], v1["plan"]["t1"], "lots", v1["plan"]["lots"])
 print("\nSAGLYA CHACHNYA PASS")
