@@ -322,4 +322,28 @@ assert sc19b["direction"] == "UP" and sc19b["score"] > 0, sc19b
 sc19c = L.flow_score("PE", 73800, 73800, 9.3, -0.8, None, 0, prem_raw=-0.9, adj=True)   # adj premium 1% khali -> noise
 assert sc19c["score"] == 0, sc19c
 print("19 OK kaccha/spot-vagalun virodhabhas -> score 0:", sc19["reasons"][0][:60])
+# 20) kadakpana: sail mode madhe jast (kinva barobar) signal, sideways madhe tari nahi
+from dataclasses import replace as _rp
+strict, med = L.Cfg(), _rp(L.Cfg(), min_crosses=1, min_aligned=2, vol_min=1.0)
+c20 = reversal_series()
+n_s = n_m = 0
+for tt in range(70, len(c20) + 1):
+    d20 = make_candles(c20[:tt])
+    n_s += L.evaluate_signal(d20, strict)["direction"] != "WAIT"
+    n_m += L.evaluate_signal(d20, med)["direction"] != "WAIT"
+assert n_m >= n_s and n_m >= 1, (n_s, n_m)
+assert L.evaluate_signal(make_candles(flat), med)["direction"] == "WAIT"
+chk = L.evaluate_signal(make_candles(c20[:124]), strict)["checks"]
+assert any("एकाच बाजूला" in c[0] and "/3" in c[2] for c in chk), chk
+print("20 OK kadakpana: kadak", n_s, "candle, madhyam", n_m, "candle; sideways = WAIT")
+# 21) sahmati
+assert L.consensus({"a": "UP", "b": "UP", "c": None, "d": None})[0] == "UP"
+assert L.consensus({"a": "UP", "b": None, "c": None, "d": None})[0] == "WAIT"
+assert L.consensus({"a": "UP", "b": "UP", "c": "DOWN", "d": None})[0] == "WAIT"        # 2 vs 1 = virodh
+assert L.consensus({"a": "UP", "b": "UP", "c": "UP", "d": "DOWN"})[0] == "UP"         # 3 vs 1 chalel
+assert L.consensus({"a": "DOWN", "b": "DOWN", "c": None, "d": None})[0] == "DOWN"
+assert L.chart_vote({"direction": "UP", "checks": []}) == "UP"
+assert L.chart_vote({"direction": "WAIT", "leaning": "DOWN", "checks": [("x", True, ""), ("y", False, "")]}) == "DOWN"   # 1 ati baki
+assert L.chart_vote({"direction": "WAIT", "leaning": "DOWN", "checks": [("x", False, ""), ("y", False, "")]}) is None   # 2 baki
+print("21 OK sahmati / chart_vote")
 print("\nSAGLYA CHACHNYA PASS")
