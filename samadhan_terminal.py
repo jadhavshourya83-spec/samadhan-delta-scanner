@@ -413,6 +413,13 @@ def flow_update(store, key, ts, ltp, oi, vol, iv=0.0, spot=0.0, delta=0.0):
         h.pop(0)
 
 
+def est_delta(side, strike, spot, step):
+    """Dhan ne delta dila nasel tar andaje delta (logistic, ATM=0.5, 2 strike OTM ~0.27). CE +, PE -."""
+    x = (strike - spot) / (2.0 * step)
+    d_ce = 1.0 / (1.0 + math.exp(max(min(x, 30), -30)))
+    return d_ce if side == "ce" else d_ce - 1.0
+
+
 def flow_ingest(store, sym, expiry, oc, spot, cfg, step, ts):
     sh = store.setdefault(f"__spot__{sym}", [])
     if spot > 0 and (not sh or ts - sh[-1][0] >= 5):
@@ -427,17 +434,32 @@ def flow_ingest(store, sym, expiry, oc, spot, cfg, step, ts):
             ltp = _f(o.get("last_price"))
             if ltp > 0:
                 dl = abs(_f((o.get("greeks") or {}).get("delta")))
+                sdl = (dl if side == "ce" else -dl) if dl > 0 else est_delta(side, strike, spot, step)
+                if dl <= 0:
+                    store["__delta_est__"] = store.get("__delta_est__", 0) + 1
                 flow_update(store, flow_key(sym, expiry, strike, side), ts, ltp, _f(o.get("oi")),
-                            _f(o.get("volume")), _f(o.get("implied_volatility")), spot,
-                            dl if side == "ce" else -dl)
+                            _f(o.get("volume")), _f(o.get("implied_volatility")), spot, sdl)
 
 
-def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
+def _spot_at(spot_hist, ts):
+    """ts chya veli (kinva tyachya aadhicha) spot; nasel tar None."""
+    best = None
+    for t, v in spot_hist or []:
+        if t <= ts + 5:
+            best = v
+        else:
+            break
+    return best
+
+
+def flow_metrics(h, window_min=5.0, min_hist_min=3.0, spot_hist=None):
     """Kharya velechi window (pratyek 30s nahi). History kami asel tar None."""
     if not h or len(h) < 3:
         return None
     t_now, ltp, oi, vol, iv = h[-1][:5]
     sp_now, dl_now = (h[-1][5], h[-1][6]) if len(h[-1]) >= 7 else (0.0, 0.0)
+    if sp_now <= 0:
+        sp_now = _spot_at(spot_hist, t_now) or 0.0
     target = t_now - window_min * 60
     ref = None
     for s in h:
@@ -455,10 +477,12 @@ def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
     oi_pct = (oi - ref[2]) / ref[2] * 100 if ref[2] > 0 else 0.0
     prem_raw = (ltp - ref[1]) / ref[1] * 100 if ref[1] > 0 else 0.0
     # SPOT-NEUTRAL premium: spot halla tar premium delta mule apoaap halto (spot khali = PE vadhto). Te vegle kara.
-    prem_pct = prem_raw
-    if len(ref) >= 7 and ref[5] > 0 and sp_now > 0 and ref[6] != 0 and dl_now != 0 and ref[1] > 0:
-        exp_chg = (ref[6] + dl_now) / 2 * (sp_now - ref[5])
-        prem_pct = (ltp - ref[1] - exp_chg) / ref[1] * 100
+    prem_pct, adj = prem_raw, False
+    ref_spot = ref[5] if len(ref) >= 7 and ref[5] > 0 else (_spot_at(spot_hist, ref[0]) or 0.0)
+    ref_dl = ref[6] if len(ref) >= 7 and ref[6] != 0 else dl_now
+    if ref_spot > 0 and sp_now > 0 and ref_dl != 0 and dl_now != 0 and ref[1] > 0:
+        exp_chg = (ref_dl + dl_now) / 2 * (sp_now - ref_spot)
+        prem_pct, adj = (ltp - ref[1] - exp_chg) / ref[1] * 100, True
     iv_chg = (iv - ref[4]) / ref[4] * 100 if (ref[4] > 0 and iv > 0) else 0.0
     new_vol = max(vol - ref[3], 0.0)
     vol_ratio = None
@@ -467,7 +491,7 @@ def flow_metrics(h, window_min=5.0, min_hist_min=3.0):
         base = max(ref[3] - h[0][3], 0.0) / earlier_s * span_s
         if base > 0:
             vol_ratio = new_vol / base
-    return {"oi_pct": oi_pct, "prem_pct": prem_pct, "prem_raw": prem_raw, "iv_chg": iv_chg, "new_vol": new_vol,
+    return {"oi_pct": oi_pct, "prem_pct": prem_pct, "prem_raw": prem_raw, "adj": adj, "iv_chg": iv_chg, "new_vol": new_vol,
             "vol_ratio": vol_ratio, "span_min": span_s / 60}
 
 
@@ -531,7 +555,8 @@ def flow_rank(store, sym, expiry, oc, spot, cfg, step):
             ltp, oi = _f(o.get("last_price")), _f(o.get("oi"))
             if ltp < cfg.flow_min_ltp or oi < cfg.min_oi:        # ashakya/pathal strikes baad
                 continue
-            m = flow_metrics(store.get(flow_key(sym, expiry, strike, side)), cfg.flow_window_min)
+            m = flow_metrics(store.get(flow_key(sym, expiry, strike, side)), cfg.flow_window_min,
+                             spot_hist=store.get(f"__spot__{sym}"))
             if not m:
                 continue
             sc = flow_score(side.upper(), strike, spot, m["oi_pct"], m["prem_pct"], m["vol_ratio"], m["iv_chg"])
@@ -598,8 +623,9 @@ def cas_detect(store, sym, expiry, oc, spot, cfg, step):
             if ltp < cfg.flow_min_ltp or oi < cfg.min_oi:
                 continue
             h = store.get(flow_key(sym, expiry, strike, side))
-            ml = flow_metrics(h, cfg.cas_long_min)
-            ms = flow_metrics(h, cfg.cas_short_min, min_hist_min=2.0)
+            sh_ = store.get(f"__spot__{sym}")
+            ml = flow_metrics(h, cfg.cas_long_min, spot_hist=sh_)
+            ms = flow_metrics(h, cfg.cas_short_min, min_hist_min=2.0, spot_hist=sh_)
             m = ml or ms
             if not m or m["oi_pct"] < 0.8 or m["prem_pct"] > 0.3:       # writing chi mul-gharat: OI vadhla, premium vadhla nahi
                 continue
@@ -951,6 +977,12 @@ def main():
             n_dn = len(flows) - n_up
             st.markdown(f"**एकूण कल:** {'🔴 DOWN' if n_dn > n_up else ('🟢 UP' if n_up > n_dn else '⚪ मिश्र')} "
                         f"(UP {n_up} / DOWN {n_dn}). सगळे एकाच दिशेला असतील तर ते स्पॉट च्या हालचालीचा परिणाम असू शकतो.")
+            if not all(x.get("adj") for x in flows):
+                st.warning("⚠ काही ओळींसाठी spot वगळून हिशेब बंद आहे (delta/spot इतिहास अपुरा). त्या ओळींचा premium कच्चा आहे, म्हणजे spot च्या हालचालीचा परिणाम त्यात मिसळलेला असू शकतो.")
+            mv = spot_move_pct(st.session_state["flow_store"], cfg.flow_window_min, sym)
+            st.caption(f"spot ची हालचाल (शेवटच्या {cfg.flow_window_min:.0f} मि): "
+                       + (f"{mv:+.2f}% (~{mv / 100 * spot:+.0f} पॉइंट)" if mv is not None else "इतिहास जमतोय")
+                       + " · Premium 'spot वगळून' = कच्चा premium − (delta × spot बदल). दोन्ही सारखे असतील तर spot ने फारसा हललाच नाही.")
             st.dataframe(pd.DataFrame([{
                 "Strike": f"{x['strike']:.0f} {x['side'].upper()}", "दिशा": x["direction"], "Score": x["score"],
                 "घ्यायचे": ("PE" if x["direction"] == "DOWN" else "CE") + f" खरेदी (ATM {atm:.0f})",
