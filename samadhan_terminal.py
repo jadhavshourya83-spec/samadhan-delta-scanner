@@ -497,12 +497,18 @@ def flow_metrics(h, window_min=5.0, min_hist_min=3.0, spot_hist=None):
             "vol_ratio": vol_ratio, "span_min": span_s / 60}
 
 
-def flow_score(side, strike, spot, oi_pct, prem_pct, vol_ratio, iv_chg):
-    """CE/PE + OI + premium cha 4 prakar. Kamal 0.5% hallchal nasel tar 'noise' (score 0)."""
+def flow_score(side, strike, spot, oi_pct, prem_pct, vol_ratio, iv_chg, prem_raw=None, adj=False):
+    """CE/PE + OI + premium cha 4 prakar. Kamal hallchal nasel tar 'noise' (score 0).
+    Spot vagalun kelela premium (adj) sathi noise-patti 1.0% (delta-matra andaja, chuka shakya).
+    Kaccha ani spot-vagalun premium chya dishaa ulat asun spot-vagalun aakda chhota (<3%) asel tar saṅket aspasht -> score 0."""
+    if prem_raw is not None and prem_raw * prem_pct < 0 and abs(prem_pct) < 3.0:
+        return {"direction": "UP", "score": 0.0, "up": 0.0, "down": 0.0,
+                "reasons": [f"premium cha sanket aspasht: kaccha {prem_raw:+.1f}% pan spot vagalun {prem_pct:+.1f}% (spot ne halavla)"]}
+    prem_floor = 1.0 if adj else 0.5
     up = down = 0.0
     r_up, r_dn = [], []
     oi_s, pr_s = min(abs(oi_pct), 20), min(abs(prem_pct), 20)
-    if abs(oi_pct) >= 0.5 and abs(prem_pct) >= 0.5:
+    if abs(oi_pct) >= 0.5 and abs(prem_pct) >= prem_floor:
         long_build = oi_pct > 0 and prem_pct > 0       # nave buyers
         short_build = oi_pct > 0 and prem_pct < 0      # nave writers
         covering = oi_pct < 0 and prem_pct > 0         # writers baher
@@ -561,7 +567,8 @@ def flow_rank(store, sym, expiry, oc, spot, cfg, step):
                              spot_hist=store.get(f"__spot__{sym}"))
             if not m:
                 continue
-            sc = flow_score(side.upper(), strike, spot, m["oi_pct"], m["prem_pct"], m["vol_ratio"], m["iv_chg"])
+            sc = flow_score(side.upper(), strike, spot, m["oi_pct"], m["prem_pct"], m["vol_ratio"], m["iv_chg"],
+                            prem_raw=m.get("prem_raw"), adj=m.get("adj", False))
             if sc["score"] >= cfg.flow_min_score:
                 out.append({"strike": strike, "side": side, "ltp": ltp, "oi": oi, **m, **sc})
     out.sort(key=lambda x: x["score"], reverse=True)
