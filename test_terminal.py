@@ -283,4 +283,26 @@ for i in range(0, 420, 30):
 mP = L.flow_metrics(stP[kk], 5.0)
 assert mP["prem_pct"] > mN["prem_pct"] + 3, (mP, mN)
 print("16 OK spot-neutral premium: kaccha", round(mN["prem_raw"], 1), "% -> spot vagalun", round(mN["prem_pct"], 2), "%")
+# 17) junya (5-tuple) itihasatahi spot vagalun chalte, spot_hist + aajcha delta vaparun
+stO = {}
+spot_h = []
+for i in range(0, 420, 30):
+    spot_i = 25000 - i * 0.5
+    ts_i = 7000 + i
+    spot_h.append((ts_i, spot_i))
+    stO.setdefault(kk, []).append((ts_i, 100 + 0.5 * (25000 - spot_i), 1000000, 1000, 12))   # junya padhatichi 5-tuple nond (spot/delta nahi)
+h_last = stO[kk][-1]
+stO[kk][-1] = h_last + (spot_h[-1][1], -0.5)                                              # shevtchi nond navin (7-tuple)
+mO = L.flow_metrics(stO[kk], 5.0, spot_hist=spot_h)
+assert mO["adj"] and abs(mO["prem_pct"]) < 0.5 and mO["prem_raw"] > 5, mO
+print("17 OK junya itihasatahi spot vagalun:", round(mO["prem_raw"], 1), "->", round(mO["prem_pct"], 2))
+# 17) delta nasel tar andaje delta vaparle jate
+stE2 = {}
+oc_nd = {"25000.000000": {"ce": {"last_price": 100.0, "oi": 10}, "pe": {"last_price": 100.0, "oi": 10}},
+         "25200.000000": {"ce": {"last_price": 20.0, "oi": 10}, "pe": {"last_price": 200.0, "oi": 10}}}
+L.flow_ingest(stE2, "NIFTY", "e", oc_nd, 25000.0, L.Cfg(), 50, 100.0)
+hc, hp, hfar = (stE2[L.flow_key("NIFTY", "e", 25000, "ce")][0], stE2[L.flow_key("NIFTY", "e", 25000, "pe")][0],
+                stE2[L.flow_key("NIFTY", "e", 25200, "ce")][0])
+assert abs(hc[6] - 0.5) < 0.01 and abs(hp[6] + 0.5) < 0.01 and 0 < hfar[6] < 0.2, (hc, hp, hfar)
+print("17 OK delta fallback:", round(hc[6], 2), round(hp[6], 2), round(hfar[6], 2))
 print("\nSAGLYA CHACHNYA PASS")
