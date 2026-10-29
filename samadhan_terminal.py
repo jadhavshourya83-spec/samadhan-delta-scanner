@@ -28,6 +28,7 @@ import pandas as pd
 class Cfg:
     cross_n: int = 3
     min_crosses: int = 2
+    min_aligned: int = 3          # DMI/VI/KST pyki kitI ekach bajula (3 = tinhi)
     adx_min: float = 20.0
     rsi_up: tuple = (52.0, 75.0)
     rsi_dn: tuple = (25.0, 48.0)
@@ -201,7 +202,8 @@ def evaluate_signal(d, cfg):
         sgn = 1 if direction == "UP" else -1
         bars = {n: bars_since_cross(x, y, direction, cfg.cross_n) for n, (x, y) in pairs.items()}
         fresh = {n: b for n, b in bars.items() if b is not None}
-        aligned = all((float(x.iloc[-1]) > float(y.iloc[-1])) == (direction == "UP") for x, y in pairs.values())
+        n_al = sum(1 for x, y in pairs.values() if (float(x.iloc[-1]) > float(y.iloc[-1])) == (direction == "UP"))
+        aligned = n_al >= cfg.min_aligned
         rsi_lo, rsi_hi = cfg.rsi_up if direction == "UP" else cfg.rsi_dn
         trend_ok = (now_close > e9.iloc[-1] > e20.iloc[-1]) if direction == "UP" else (now_close < e9.iloc[-1] < e20.iloc[-1])
         ext = (now_close - float(e20.iloc[-1])) * sgn / now_atr
@@ -210,7 +212,7 @@ def evaluate_signal(d, cfg):
         checks = [
             (f"ताजे cross ≥ {cfg.min_crosses} (गेल्या {cfg.cross_n} candle)", len(fresh) >= cfg.min_crosses,
              ", ".join(f"{n}:{b} candle आधी" for n, b in fresh.items()) or "एकही ताजा cross नाही"),
-            ("DMI, VI, KST तिन्ही एकाच बाजूला", aligned, ""),
+            (f"DMI, VI, KST पैकी ≥ {cfg.min_aligned} एकाच बाजूला", aligned, f"{n_al}/3"),
             (f"ADX ≥ {cfg.adx_min:.0f}", float(adx.iloc[-1]) >= cfg.adx_min, f"{float(adx.iloc[-1]):.1f}"),
             ("किंमत/EMA9/EMA20 दिशेनुसार", bool(trend_ok), f"EMA9 {float(e9.iloc[-1]):.1f}, EMA20 {float(e20.iloc[-1]):.1f}"),
             (f"RSI {rsi_lo:.0f}–{rsi_hi:.0f}", rsi_lo <= float(r.iloc[-1]) <= rsi_hi, f"{float(r.iloc[-1]):.1f}"),
@@ -742,6 +744,28 @@ def v40_plan(sig, oc, atr_u, cfg, lot_size, capital, risk_pct, step):
     return {"ok": plan["ok"], "opt": opt, "plan": plan, "note": plan.get("note", "")}
 
 
+# ───────── SAHMATI (sagle engine eka nirnayat) ─────────
+def chart_vote(sig):
+    """Chart: purn signal = vote. Ekhadich ati kami asel (<=1 apayshi) tar jhukav vote."""
+    if sig.get("direction") in ("UP", "DOWN"):
+        return sig["direction"]
+    failed = sum(1 for c in sig.get("checks", []) if not c[1])
+    if sig.get("leaning") in ("UP", "DOWN") and failed <= 1:
+        return sig["leaning"]
+    return None
+
+
+def consensus(votes):
+    """votes = {'चार्ट': 'UP'|'DOWN'|None, ...}. Nirnay: kimaan 2 sahmat ani virodhi 0, kinva >=3 sahmat ani virodhi <=1.
+    Hi bhavishyavani nahi; 'kiti engine ekmat' evdhech sangte."""
+    up = [k for k, v in votes.items() if v == "UP"]
+    dn = [k for k, v in votes.items() if v == "DOWN"]
+    for d, agree, opp in (("UP", up, dn), ("DOWN", dn, up)):
+        if (len(agree) >= 2 and not opp) or (len(agree) >= 3 and len(opp) <= 1):
+            return d, agree, opp
+    return "WAIT", up if len(up) >= len(dn) else dn, dn if len(up) >= len(dn) else up
+
+
 # ═════════════════════════════ PART 2: STREAMLIT UI ═════════════════════════════
 INDEX_MAP = {"NIFTY": dict(id=13, step=50, lot=65), "BANKNIFTY": dict(id=25, step=100, lot=30),
              "SENSEX": dict(id=51, step=100, lot=20)}
@@ -750,6 +774,7 @@ INDEX_MAP = {"NIFTY": dict(id=13, step=50, lot=65), "BANKNIFTY": dict(id=25, ste
 def main():
     import json
     import os
+    from dataclasses import replace
     import time
     from datetime import timedelta, timezone
     from pathlib import Path
@@ -796,6 +821,10 @@ def main():
             cas_strong = st.slider("STRONG score किमान", 50, 95, 70, 5)
             cas_late = st.slider("spot इतका हलला तर 'LATE' %", 0.1, 1.0, 0.40, 0.05)
         run_v40_on = st.checkbox("V40.2 OI इंजिन (तुमचा कोड) चालवा", True)
+        mode = st.selectbox("🎚 सिग्नल कडकपणा", ["कडक (कमी, चांगले)", "मध्यम", "सैल (जास्त, कमजोर)"], 0,
+                            help="कडक: ≥2 ताजे cross, तिन्ही एका बाजूला, volume 1.2x. मध्यम: 1 ताजा cross, 2/3 एका बाजूला, volume 1.0x. "
+                                 "सैल: मध्यम + volume बंद + cross 4 candle पर्यंत. मध्यम/सैल निवडल्यास खालचे काही फिल्टर यांनी बदलले जातात. "
+                                 "Journal मध्ये प्रत्येक entry चा कडकपणा नोंदला जातो, म्हणून कोणता चांगला ते 30+ निकालांनंतर पाहता येते.")
         with st.expander("⚙ प्रगत फिल्टर"):
             min_cross = st.slider("ताजे cross किमान (DMI/VI/KST पैकी)", 1, 3, 2)
             cross_n = st.slider("cross किती candle पर्यंत 'ताजा'", 1, 6, 3)
@@ -816,6 +845,12 @@ def main():
               max_loss_pct=float(max_loss), min_oi=float(min_oi), max_spread_pct=max_spread, use_volume=use_volume,
               window_start=w_start, window_end=w_end, cooldown_min=cooldown, flow_window_min=float(flow_window),
               flow_min_score=float(flow_min), cas_early=float(cas_early), cas_strong=float(cas_strong), cas_late_pct=float(cas_late))
+
+    if mode.startswith("मध्यम"):
+        cfg = replace(cfg, min_crosses=1, min_aligned=2, vol_min=1.0)
+    elif mode.startswith("सैल"):
+        cfg = replace(cfg, min_crosses=1, min_aligned=2, use_volume=False, cross_n=max(cfg.cross_n, 4))
+    mode_name = mode.split(" ")[0]
 
     if "journal" not in st.session_state:
         try:
@@ -934,7 +969,8 @@ def main():
         if not in_trade_window(now, cfg.window_start, cfg.window_end):
             reasons.append(f"ट्रेड वेळेबाहेर ({cfg.window_start}–{cfg.window_end}, सोम–शुक्र)")
         if direction == "WAIT":
-            reasons.append("सर्व अटी एकत्र जुळल्या नाहीत (खाली चेकलिस्ट पहा)")
+            failed = [c[0] for c in sig["checks"] if not c[1]]
+            reasons.append("बाकी अटी: " + "; ".join(failed[:4]) if failed else "सर्व अटी एकत्र जुळल्या नाहीत")
         else:
             opt = pick_option(oc, spot, direction, meta["step"], cfg, itm_steps=1 if strike_mode.startswith("1") else 0)
             if not opt["ok"]:
@@ -951,7 +987,9 @@ def main():
 
         enter = direction in ("UP", "DOWN") and not reasons and plan is not None
         if enter:
-            st.session_state["journal"].append(new_trade(sym, direction, expiry, opt, plan, now_ts, sig["candle"], rel))
+            tr_ = new_trade(sym, direction, expiry, opt, plan, now_ts, sig["candle"], rel)
+            tr_["mode"] = mode_name
+            st.session_state["journal"].append(tr_)
             ok = send_telegram(fmt_alert(sym, direction, expiry, opt, plan, sig, flow_txt))
             st.toast("Telegram: " + ("पाठवला" if ok else "पाठवला नाही (secrets तपासा)"))
 
@@ -964,6 +1002,7 @@ def main():
         # ───────── UI ─────────
         st.caption(f"{now:%d-%b %H:%M:%S} IST · Spot {spot:,.1f} · {note} · ATR {sig['atr']:.1f} · "
                    f"ADX {sig['adx']:.0f} · RSI {sig['rsi']:.0f}")
+        top = st.container()          # sahmati nirnay ithe (V40 nantar bharto)
         if enter:
             kind, color = ("CALL (CE) खरेदी", "#0b5d1e") if direction == "UP" else ("PUT (PE) खरेदी", "#7a1020")
             st.markdown(
@@ -1007,13 +1046,14 @@ def main():
                         f"(UP {n_up} / DOWN {n_dn}). सगळे एकाच दिशेला असतील तर ते स्पॉट च्या हालचालीचा परिणाम असू शकतो.")
             if not all(x.get("adj") for x in flows):
                 st.warning("⚠ काही ओळींसाठी spot वगळून हिशेब बंद आहे (delta/spot इतिहास अपुरा). त्या ओळींचा premium कच्चा आहे, म्हणजे spot च्या हालचालीचा परिणाम त्यात मिसळलेला असू शकतो.")
+            st.caption("ℹ️ 'Strike' स्तंभ = जिथे हालचाल दिसली (पुरावा, तो खरेदी करायचा नाही). घ्यायचा नेमका strike खालच्या 📍 बॉक्समध्ये येतो (ATM किंवा तुमच्या निवडीनुसार).")
             mv = spot_move_pct(st.session_state["flow_store"], cfg.flow_window_min, sym)
             st.caption(f"spot ची हालचाल (शेवटच्या {cfg.flow_window_min:.0f} मि): "
                        + (f"{mv:+.2f}% (~{mv / 100 * spot:+.0f} पॉइंट)" if mv is not None else "इतिहास जमतोय")
                        + " · Premium 'spot वगळून' = कच्चा premium − (delta × spot बदल). दोन्ही सारखे असतील तर spot ने फारसा हललाच नाही.")
             st.dataframe(pd.DataFrame([{
                 "Strike": f"{x['strike']:.0f} {x['side'].upper()}", "दिशा": x["direction"], "Score": x["score"],
-                "घ्यायचे": ("PE" if x["direction"] == "DOWN" else "CE") + f" खरेदी (ATM {atm:.0f})",
+                "संकेत (घ्यायचा option)": ("PE" if x["direction"] == "DOWN" else "CE") + f" बाजूला, ATM {atm:.0f} जवळ",
                 f"OI Δ% ({x['span_min']:.0f}मि)": round(x["oi_pct"], 1),
                 "Premium Δ% (spot वगळून)": round(x["prem_pct"], 1), "Premium Δ% (कच्चा)": round(x["prem_raw"], 1),
                 "Volume x": round(x["vol_ratio"], 1) if x["vol_ratio"] else None, "OI": f"{x['oi']:,.0f}",
@@ -1074,10 +1114,19 @@ def main():
             st.caption(f"फक्त {sm['wins'] + sm['losses']} निकाल. 30+ होईपर्यंत win rate वर विश्वास ठेवू नका. "
                        "'जिंकले' = किमान T1 लागला. Refresh च्या मधला wick चुकू शकतो.")
         if J:
+            by_mode = {}
+            for t in J:
+                by_mode.setdefault(t.get("mode", "—"), []).append(t)
+            if len(by_mode) > 1:
+                st.caption("कडकपणानुसार निकाल (जिंकले = T1 लागला, हरले = SL):")
+                st.dataframe(pd.DataFrame([{"कडकपणा": k, "एकूण": len(v), "जिंकले": summarize(v)["wins"], "हरले": summarize(v)["losses"],
+                                            "Win rate %": None if summarize(v)["win_rate"] is None else round(summarize(v)["win_rate"])}
+                                           for k, v in by_mode.items()]), hide_index=True, use_container_width=True)
             rows = [{"वेळ": datetime.fromtimestamp(t["t"], IST).strftime("%d-%b %H:%M"), "Index": t["sym"],
                      "Option": f"{t['strike']:.0f} {t['side'].upper()}", "Expiry": t["expiry"], "Entry": t["entry"],
                      "आत्ता": t["last"], "SL": t["sl"], "T1": t["t1"], "T2": t["t2"], "Lots": t["lots"],
                      "OI flow": {"agree": "✅", "oppose": "⚠", "none": "—"}.get(t.get("flow", "none"), "—"),
+                     "कडकपणा": t.get("mode", "—"),
                      "Status": t["status"], "P/L pts": round((t["exit"] or t["last"]) - t["entry"], 2)}
                     for t in reversed(J)]
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
@@ -1111,6 +1160,44 @@ def main():
                                 f"कमाल तोटा ₹{p_['max_loss']:.0f}  (V40 चा SL नाही; हा index ATR+delta वरून अंदाजे)")
                     else:
                         st.warning("V40 सिग्नल आहे, पण योजना बनत नाही: " + (vp["note"] or "?"))
+
+        # ───────── सहमती: चार्ट + OI flow + CAS + V40 ─────────
+        v40_vs = st.session_state.get("v40_last_signal") if run_v40_on else None
+        v40_act = bool(v40_vs and v40_vs.get("scan") == st.session_state.get("v40_scan_count"))
+        cas_strong = next((c for c in cas_list if c["stage"] == "STRONG"), None)
+        votes = {"चार्ट": chart_vote(sig),
+                 "OI flow": flow_dir,
+                 "CAS": (None if not cas_strong else ("UP" if cas_strong["bias"] == "BULLISH" else "DOWN")),
+                 "V40": (("UP" if v40_vs["type"] == "CE" else "DOWN") if v40_act else None)}
+        c_dir, c_agree, c_opp = consensus(votes)
+        with top:
+            vrow = {k: {"UP": "🟢 UP", "DOWN": "🔴 DOWN", None: "—"}[v] for k, v in votes.items()}
+            if c_dir != "WAIT":
+                copt = pick_option(oc, spot, c_dir, meta["step"], cfg, itm_steps=1 if strike_mode.startswith("1") else 0)
+                cplan = trade_plan(copt, sig["atr"], cfg, int(lot_size), float(capital), float(risk_pct)) if copt["ok"] else None
+                if cplan and cplan["ok"]:
+                    side_t = "CALL (CE)" if c_dir == "UP" else "PUT (PE)"
+                    st.success(f"🎯 **सहमती {len(c_agree)}/4: {side_t} खरेदी · {sym} {copt['strike']:.0f}** · Entry ~₹{cplan['entry']} · "
+                               f"SL ₹{cplan['sl']} · T1 ₹{cplan['t1']} · T2 ₹{cplan['t2']} · {cplan['lots']} lot · "
+                               f"कमाल तोटा ₹{cplan['max_loss']:.0f}\n\nसहमत: {', '.join(c_agree)}"
+                               + (f" · विरोधी: {', '.join(c_opp)}" if c_opp else ""))
+                    if (in_trade_window(now, cfg.window_start, cfg.window_end)
+                            and cooldown_ok(st.session_state["journal"], sym, c_dir, now_ts, cfg.cooldown_min, "cons-" + sig["candle"])):
+                        tr2 = new_trade(sym, c_dir, expiry, copt, cplan, now_ts, "cons-" + sig["candle"], "agree" if flow_dir == c_dir else "none")
+                        tr2["mode"] = f"सहमती {len(c_agree)}/4"
+                        st.session_state["journal"].append(tr2)
+                        save_journal()
+                        send_telegram(f"🎯 {sym} सहमती {len(c_agree)}/4 ({', '.join(c_agree)}): {side_t} {copt['strike']:.0f} | "
+                                      f"Entry {cplan['entry']} SL {cplan['sl']} T1 {cplan['t1']} T2 {cplan['t2']} | {cplan['lots']} lot, "
+                                      f"कमाल तोटा ₹{cplan['max_loss']:.0f}. सल्ला नाही.")
+                else:
+                    st.warning(f"सहमती {c_dir} ({', '.join(c_agree)}), पण option/योजना बनत नाही: "
+                               + ("; ".join(copt.get("issues", [])) if not copt["ok"] else (cplan or {}).get("note", "")))
+            else:
+                st.info("⏳ **सहमती नाही**: किमान 2 इंजिन एकाच दिशेला आणि कुणी विरोधात नसावे लागते.")
+            st.dataframe(pd.DataFrame([vrow]), hide_index=True, use_container_width=True)
+            st.caption("चार्ट = पूर्ण सिग्नल किंवा फक्त 1 अट बाकी · OI flow = 2 मिनिटे टिकलेला · CAS = STRONG आणि LATE नाही · V40 = आत्ता सक्रिय सिग्नल. "
+                       "जास्त इंजिन सहमत म्हणजे जास्त खात्रीशीर असे सिद्ध नाही; Journal मध्ये 'सहमती 2/4', '3/4' चे निकाल वेगळे पाहून ठरवा.")
 
         st.info("हे इंडिकेटर-नियम आहेत, भाकीत नाही. SL/Target index ATR आणि delta वरून premium मध्ये काढले आहेत "
                 "(अंदाजे; gamma/theta धरलेले नाही). OI flow फक्त माहिती आहे, ऑपरेटर कोण हे सिद्ध होत नाही. खरे पैसे "
