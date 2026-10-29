@@ -285,14 +285,16 @@ def chain_ltp(oc, strike, side):
     return v if v > 0 else None
 
 
-def pick_option(oc, spot, direction, step, cfg, itm_steps=0):
+def pick_option(oc, spot, direction, step, cfg, itm_steps=0, strike_override=None):
     side = "ce" if direction == "UP" else "pe"
     smap = strike_map(oc)
     if not smap:
         return {"ok": False, "issues": ["option chain रिकामी"], "side": side}
     atm = round(spot / step) * step
     target = atm - itm_steps * step if side == "ce" else atm + itm_steps * step
-    strike = min(smap, key=lambda s: abs(s - target))
+    strike = float(strike_override) if strike_override is not None else min(smap, key=lambda s: abs(s - target))
+    if strike not in smap:
+        return {"ok": False, "issues": [f"strike {strike:.0f} chain madhe nahi"], "side": side}
     node = (smap[strike] or {}).get(side) or {}
     ltp, bid, ask = _f(node.get("last_price")), _f(node.get("top_bid_price")), _f(node.get("top_ask_price"))
     oi, vol = _f(node.get("oi")), _f(node.get("volume"))
@@ -719,6 +721,20 @@ def cas_spread(c, oc, step, lot_size, capital, risk_pct, cfg):
             "rr": round(best["rr"], 2), "breakeven": sell + best["credit"] if side == "ce" else sell - best["credit"],
             "name": "BEAR CALL CREDIT SPREAD" if side == "ce" else "BULL PUT CREDIT SPREAD"}
 
+# ───────── V40.2 engine (v40_engine.py) cha signal -> tumcha option plan ─────────
+def v40_plan(sig, oc, atr_u, cfg, lot_size, capital, risk_pct, step):
+    """sig = st.session_state.v40_last_signal ({'type':'CE'|'PE','strike':..}). V40 swasta OTM (delta 0.1-0.3) options ghet asalyane
+    delta-pattyachi mayada ruNdavli jate. Strike V40 ch, SL/T1/T2/lots tumchya jokhim niyamanusar."""
+    from dataclasses import replace
+    c2 = replace(cfg, min_delta=0.05, max_delta=0.80)
+    d = "UP" if sig["type"] == "CE" else "DOWN"
+    opt = pick_option(oc, 0.0, d, step, c2, strike_override=float(sig["strike"]))
+    if not opt.get("ok"):
+        return {"ok": False, "opt": opt, "note": "option batla: " + "; ".join(opt.get("issues", []))}
+    plan = trade_plan(opt, atr_u, cfg, lot_size, capital, risk_pct)
+    return {"ok": plan["ok"], "opt": opt, "plan": plan, "note": plan.get("note", "")}
+
+
 # ═════════════════════════════ PART 2: STREAMLIT UI ═════════════════════════════
 INDEX_MAP = {"NIFTY": dict(id=13, step=50, lot=65), "BANKNIFTY": dict(id=25, step=100, lot=30),
              "SENSEX": dict(id=51, step=100, lot=20)}
@@ -736,6 +752,10 @@ def main():
 
     IST = timezone(timedelta(hours=5, minutes=30))
     JOURNAL = Path(__file__).with_name("entry_journal.json")
+
+    @st.cache_resource(show_spinner=False)
+    def get_v40_code(path):
+        return compile(Path(path).read_text(encoding="utf-8"), path, "exec")
 
     st.set_page_config(page_title="Samadhan Terminal", page_icon="🚩", layout="wide")
     st.title("🚩 समाधान टर्मिनल")
@@ -768,6 +788,7 @@ def main():
             cas_early = st.slider("EARLY score किमान", 30, 80, 50, 5)
             cas_strong = st.slider("STRONG score किमान", 50, 95, 70, 5)
             cas_late = st.slider("spot इतका हलला तर 'LATE' %", 0.1, 1.0, 0.40, 0.05)
+        run_v40_on = st.checkbox("V40.2 OI इंजिन (तुमचा कोड) चालवा", True)
         with st.expander("⚙ प्रगत फिल्टर"):
             min_cross = st.slider("ताजे cross किमान (DMI/VI/KST पैकी)", 1, 3, 2)
             cross_n = st.slider("cross किती candle पर्यंत 'ताजा'", 1, 6, 3)
@@ -1053,6 +1074,37 @@ def main():
                      "Status": t["status"], "P/L pts": round((t["exit"] or t["last"]) - t["entry"], 2)}
                     for t in reversed(J)]
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        if run_v40_on:
+            st.divider()
+            v40_file = Path(__file__).with_name("v40_engine.py")
+            if not v40_file.exists():
+                st.warning("v40_engine.py सापडली नाही (samadhan_terminal.py च्या शेजारी ठेवा).")
+            else:
+                ctx = (sym, expiry)
+                if st.session_state.get("v40_ctx") != ctx:          # index/expiry badalla = V40 chi memory navi (key madhe index nasto)
+                    for k_ in [k_ for k_ in st.session_state if str(k_).startswith("v40_")]:
+                        del st.session_state[k_]
+                    st.session_state["v40_ctx"] = ctx
+                for env_k, sec_k in (("V40_TELEGRAM_TOKEN", "TELEGRAM_TOKEN"), ("V40_TELEGRAM_CHAT", "TELEGRAM_CHAT_ID")):
+                    if secret(sec_k) and not os.environ.get(env_k):
+                        os.environ[env_k] = secret(sec_k)
+                g = {"__name__": "v40_engine", "OptionChain": {"data": {"data": {"oc": oc, "last_price": spot}}},
+                     "spot": spot, "df_5": df, "expiry": expiry}
+                try:
+                    exec(get_v40_code(str(v40_file)), g)
+                except Exception as e_:
+                    st.error(f"V40 इंजिन त्रुटी: {e_}")
+                vs = st.session_state.get("v40_last_signal")
+                if vs and vs.get("scan") == st.session_state.get("v40_scan_count"):
+                    vp = v40_plan(vs, oc, sig["atr"], cfg, int(lot_size), float(capital), float(risk_pct), meta["step"])
+                    if vp["ok"]:
+                        p_ = vp["plan"]
+                        st.info(f"📍 **V40 सिग्नलची योजना (तुमच्या जोखमीनुसार):** {sym} **{vs['strike']} {vs['type']}** खरेदी · "
+                                f"Entry ~₹{p_['entry']} · SL ₹{p_['sl']} · T1 ₹{p_['t1']} · T2 ₹{p_['t2']} · {p_['lots']} lot · "
+                                f"कमाल तोटा ₹{p_['max_loss']:.0f}  (V40 चा SL नाही; हा index ATR+delta वरून अंदाजे)")
+                    else:
+                        st.warning("V40 सिग्नल आहे, पण योजना बनत नाही: " + (vp["note"] or "?"))
+
         st.info("हे इंडिकेटर-नियम आहेत, भाकीत नाही. SL/Target index ATR आणि delta वरून premium मध्ये काढले आहेत "
                 "(अंदाजे; gamma/theta धरलेले नाही). OI flow फक्त माहिती आहे, ऑपरेटर कोण हे सिद्ध होत नाही. खरे पैसे "
                 "लावण्याआधी काही आठवडे paper-trade करा. हा आर्थिक सल्ला नाही.")
