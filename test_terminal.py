@@ -314,4 +314,12 @@ assert v1["ok"] and v1["opt"]["strike"] == 25100 and v1["plan"]["lots"] >= 1 and
 v2 = L.v40_plan({"type": "CE", "strike": 99999}, oc18, 40.0, L.Cfg(), 65, 1500000, 1.0, 50)
 assert not v2["ok"] and "chain" in v2["note"], v2
 print("18 OK V40 plan:", v1["opt"]["strike"], v1["plan"]["entry"], v1["plan"]["sl"], v1["plan"]["t1"], "lots", v1["plan"]["lots"])
+# 19) tumcha CSV: PE OI +9.3%, kaccha premium +7.8% pan spot vagalun -1.7% -> aspasht, score 0
+sc19 = L.flow_score("PE", 73800, 73800, 9.3, -1.7, 0.7, 0, prem_raw=7.8, adj=True)
+assert sc19["score"] == 0 and "aspasht" in sc19["reasons"][0], sc19
+sc19b = L.flow_score("PE", 73800, 73800, 9.3, -7.0, None, 0, prem_raw=-2.0, adj=True)   # donhi nakaratmak, spot vagalun motha -> chalu
+assert sc19b["direction"] == "UP" and sc19b["score"] > 0, sc19b
+sc19c = L.flow_score("PE", 73800, 73800, 9.3, -0.8, None, 0, prem_raw=-0.9, adj=True)   # adj premium 1% khali -> noise
+assert sc19c["score"] == 0, sc19c
+print("19 OK kaccha/spot-vagalun virodhabhas -> score 0:", sc19["reasons"][0][:60])
 print("\nSAGLYA CHACHNYA PASS")
