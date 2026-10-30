@@ -59,7 +59,11 @@ with st.sidebar:
     st.subheader("Stage 4 — एकच CONFIRMED ENTRY")
     capital = st.number_input("Capital ($)", 10.0, value=1000.0, step=100.0)
     risk_pct = st.slider("प्रति trade जोखीम % (SL लागल्यास)", 0.25, 3.0, 1.0, 0.25)
-    e_conf = st.slider("ENTRY साठी किमान पुष्टी (5 पैकी)", 2, 5, 4, 1)
+    eng_n = st.slider("इंजिन: किती coins तपासायचे (turnover नुसार टॉप)", 10, 60, 30, 5)
+    eng_min = st.slider("ENTRY साठी किमान Score (0-100)", 50, 90, 68, 2,
+                        help="कमी = जास्त entries पण कमी दर्जा. जास्त = कमी पण कडक.")
+    eng_rr = st.slider("Target = किती R (SL च्या पटीत)", 1.5, 4.0, 2.0, 0.5)
+    e_conf = st.slider("(जुना gate) ENTRY साठी किमान पुष्टी (5 पैकी)", 2, 5, 4, 1)
     e_vol = st.slider("किमान Volume x (median च्या)", 1.0, 3.0, 1.5, 0.1)
     e_adx = st.slider("ENTRY साठी किमान ADX", 15, 35, 22, 1)
     e_ext = st.slider("कमाल extension (ATR) - पाठलाग नको", 0.5, 3.0, 1.5, 0.25)
@@ -549,6 +553,128 @@ def apply_entry(df, live):
     return df, details
 
 
+# ───────────────────────── ENGINE v7 : SAMADHAN CRYPTO ENTRY SCORE ─────────────────────────
+# Sagle liquid coins var chalto. Prati coin LONG ani SHORT dogh bajunche score (0-100):
+#   15m trend 25 | trigger (breakout kinva EMA20 pullback-bounce) 25 | momentum (DMI/ADX/RSI) 20
+#   | volume 15 | extension (EMA20 pasun antar) 10 | OI + funding sandarbh 5
+# HARD BLOCK: 15m trend ulat, trigger nahi, kinva price EMA20 pasun >3 ATR dur (pathlaag nako).
+def dmi_vals(d, n=14):
+    up_move, dn_move = d.high.diff(), -d.low.diff()
+    pdm = up_move.where((up_move > dn_move) & (up_move > 0), 0.0)
+    mdm = dn_move.where((dn_move > up_move) & (dn_move > 0), 0.0)
+    atr = wilder(true_range(d), n)
+    pdi, mdi = 100 * wilder(pdm, n) / atr, 100 * wilder(mdm, n) / atr
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return pdi, mdi, wilder(dx.fillna(0), n), atr
+
+
+def rsi_series(c, n=14):
+    dlt = c.diff()
+    g, l_ = wilder(dlt.clip(lower=0), n), wilder((-dlt).clip(lower=0), n)
+    return 100 - 100 / (1 + g / l_.replace(0, np.nan))
+
+
+def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0):
+    """d5/d15: closed-candle DataFrames. Return best side dict kinva None."""
+    if len(d5) < 60 or len(d15) < 55:
+        return None
+    c, h, l_, v = d5.close, d5.high, d5.low, d5.volume.fillna(0)
+    e20, e50 = c.ewm(span=20, adjust=False).mean(), c.ewm(span=50, adjust=False).mean()
+    pdi, mdi, adx, atr_s = dmi_vals(d5)
+    rsi = rsi_series(c)
+    atr = float(atr_s.iloc[-1])
+    price = float(c.iloc[-1])
+    if atr <= 0 or price <= 0:
+        return None
+    c15 = d15.close
+    t20, t50 = c15.ewm(span=20, adjust=False).mean(), c15.ewm(span=50, adjust=False).mean()
+    p15 = float(c15.iloc[-1])
+    base = float(v.iloc[-43:-3].median())
+    vr = float(v.iloc[-3:].max()) / base if base > 0 else 0.0
+    ext = abs(price - float(e20.iloc[-1])) / atr
+    out = []
+    for side in ("UP", "DOWN"):
+        up = side == "UP"
+        sg = 1 if up else -1
+        if up:
+            htf = 25 if (p15 > t50.iloc[-1] and t20.iloc[-1] > t50.iloc[-1]) else (12 if p15 > t50.iloc[-1] else None)
+        else:
+            htf = 25 if (p15 < t50.iloc[-1] and t20.iloc[-1] < t50.iloc[-1]) else (12 if p15 < t50.iloc[-1] else None)
+        if htf is None or ext > 3.0:
+            continue
+        # trigger
+        trig, setup = 0, ""
+        for k in (1, 2, 3):                                   # gelya 3 closed candle madhe breakout
+            i = len(c) - k
+            lvl = float(h.iloc[i - 20:i].max()) if up else float(l_.iloc[i - 20:i].min())
+            if (up and c.iloc[i] > lvl) or (not up and c.iloc[i] < lvl):
+                if (up and price > lvl) or (not up and price < lvl):   # ajun tikla ahe
+                    trig, setup = 25, f"20-candle breakout ({k} candle purvi)"
+                    break
+        if not trig:                                           # pullback bounce EMA20 var
+            trend_ok = (e20.iloc[-1] > e50.iloc[-1]) if up else (e20.iloc[-1] < e50.iloc[-1])
+            touch = any((l_.iloc[-k] <= e20.iloc[-k] * 1.001) if up else (h.iloc[-k] >= e20.iloc[-k] * 0.999)
+                        for k in (2, 3, 4))
+            back = (price > e20.iloc[-1] and c.iloc[-1] > c.iloc[-2]) if up else (price < e20.iloc[-1] and c.iloc[-1] < c.iloc[-2])
+            if trend_ok and touch and back:
+                trig, setup = 22, "EMA20 pullback + bounce"
+        if not trig:
+            continue
+        mom = (8 if ((pdi.iloc[-1] > mdi.iloc[-1]) if up else (pdi.iloc[-1] < mdi.iloc[-1])) else 0) \
+            + (6 if adx.iloc[-1] >= 18 else 0) + (3 if adx.iloc[-1] > adx.iloc[-4] else 0) \
+            + (3 if ((50 <= rsi.iloc[-1] <= 72) if up else (28 <= rsi.iloc[-1] <= 50)) else 0)
+        volp = 15 * min(1.0, max(0.0, (vr - 0.8) / 1.0))
+        extp = 10 * max(0.0, 1 - ext / 3.0)
+        ctx = 0
+        if (up and oi_pct > 0.5 and price6h > 0) or (not up and oi_pct > 0.5 and price6h < 0):
+            ctx += 5
+        if (up and funding >= crowd) or (not up and funding <= -crowd):
+            ctx -= 5
+        score = htf + trig + mom + volp + extp + ctx
+        # SL: swing (gelya 10 candle) +/- 0.2 ATR, kamit 1 ATR, jastit jast 2.5 ATR
+        sw = float(l_.iloc[-10:].min()) - 0.2 * atr if up else float(h.iloc[-10:].max()) + 0.2 * atr
+        dist = min(max(abs(price - sw), 1.0 * atr), 2.5 * atr)
+        out.append({"side": side, "score": round(score, 1), "setup": setup, "htf": htf, "trig": trig,
+                    "mom": mom, "vr": vr, "adx": float(adx.iloc[-1]), "rsi": float(rsi.iloc[-1]),
+                    "ext": ext, "atr": atr, "price": price, "sl": price - sg * dist,
+                    "t1": price + sg * dist, "tp": price + sg * rr * dist, "dist": dist})
+    return max(out, key=lambda x: x["score"]) if out else None
+
+
+def engine_scan(live, pinned, n, rr):
+    pool = sorted(((s, v) for s, v in live.items() if v.get("turnover", 0) >= min_turnover and v["price"] > 0),
+                  key=lambda x: x[1]["turnover"], reverse=True)
+    syms = list(dict.fromkeys([p for p in pinned] + [s for s, _ in pool[:n]]))
+
+    def work(sym):
+        try:
+            d5, d15 = candles(sym, "5m", 150), candles(sym, "15m", 120)
+            v = live.get(sym, {})
+            r = score_coin(d5, d15, v.get("oi_pct", 0.0), 0.0, v.get("funding", 0.0), crowd_thr, rr)
+            if r:
+                # 6h price change (72 x 5m) OI sandarbhasathi
+                r["p6h"] = pct(float(d5.close.iloc[-1]), float(d5.close.iloc[-73])) if len(d5) > 73 else 0.0
+                if (r["side"] == "UP" and v.get("oi_pct", 0) > 0.5 and r["p6h"] > 0) or \
+                   (r["side"] == "DOWN" and v.get("oi_pct", 0) > 0.5 and r["p6h"] < 0):
+                    pass
+                r["sym"] = sym
+            return r
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = [r for r in ex.map(work, syms) if r]
+    res.sort(key=lambda x: x["score"], reverse=True)
+    return res, len(syms)
+
+
+def eng_plan(r, capital, risk_pct):
+    risk_usd = capital * risk_pct / 100
+    notional = risk_usd / (r["dist"] / r["price"])
+    return {"risk_usd": risk_usd, "notional": notional, "lev": notional / capital if capital > 0 else 0,
+            "sl_pct": r["dist"] / r["price"] * 100}
+
+
 # ───────────────────────── OI HISTORY + OPERATOR FOOTPRINTS ─────────────────────────
 # Prati scan prati coin cha (vel, price, OI value, funding) lakshat theto (session madhe, max 3 tas).
 # OI "contracts" = oi_value_usd / price  -> price badalla tari OI chi khari vadh dakhavto.
@@ -772,7 +898,7 @@ def update_tracker(df, live):
             sign = 1 if r.ENTRY == "UP" else -1
             T[f"{r.Symbol}|{r.ENTRY}|{int(now)}"] = {
                 "symbol": r.Symbol, "dir": r.ENTRY, "t": now, "entry": entry,
-                "sl": entry - sign * sl_atr * float(r.ATR), "tp": entry + sign * tp_atr * float(r.ATR),
+                "sl": float(r.SL), "tp": float(r.TP),
                 "sig": float(r["Signal Score"]), "mom": int(r["Momentum Score"]),
                 "oi_meaning": r["OI Meaning"], "oi_pct": float(r["OI Change 6h %"]),
                 "smc": r["SMC Setup"], "last": entry, "pnl": 0.0, "max_pnl": 0.0, "min_pnl": 0.0,
@@ -905,12 +1031,59 @@ def scan_view():
                           ((df.FINAL == "DOWN") & (df.Funding <= -crowd_thr))
                 df.loc[crowded, "FINAL"] = "NO"
 
-        if not df.empty:
-            df, egates = apply_entry(df, live)
-        else:
-            egates = {}
+        egates = {}
+        with st.spinner("इंजिन: coins चे 5m + 15m candles तपासत आहे..."):
+            eng, n_eng = engine_scan(live, [p[0] for p in pinned], eng_n, eng_rr)
+        best = eng[0] if eng else None
+        if best and best["score"] >= eng_min:
+            tk_ = taker_flow(best["sym"])
+            adj = 0
+            if tk_["ok"]:
+                sh = tk_["buy_share"]
+                adj = (5 if sh >= 0.55 else (-8 if sh <= 0.40 else 0)) if best["side"] == "UP" \
+                    else (5 if sh <= 0.45 else (-8 if sh >= 0.60 else 0))
+            best["score"] = min(100.0, best["score"] + adj)
+            best["taker"] = f'{tk_["buy_share"] * 100:.0f}% खरेदी ({adj:+d})' if tk_["ok"] else "डेटा नाही"
+        entered = bool(best and best["score"] >= eng_min)
+        df_e = pd.DataFrame()
+        if entered:
+            pe = live.get(best["sym"], {}).get("price") or best["price"]
+            df_e = pd.DataFrame([{"Symbol": best["sym"], "ENTRY": best["side"], "Price": pe, "SL": best["sl"],
+                                  "TP": best["tp"], "Signal Score": best["score"], "Momentum Score": int(best["mom"]),
+                                  "OI Meaning": best["setup"], "OI Change 6h %": live.get(best["sym"], {}).get("oi_pct", 0.0),
+                                  "SMC Setup": best["setup"]}])
+        T = update_tracker(df_e, live)      # navin ENTRY save kara, junyanchi live price/SL/TP update kara
 
-        T = update_tracker(df, live)      # navin ENTRY save kara, junyanchi live price/SL/TP update kara
+        st.subheader("🎯 ENTRY — एकच CONFIRMED (Samadhan Crypto Score)")
+        st.caption(f"{n_eng} coins तपासले (5m + 15m, फक्त closed candles). ENTRY = सर्वोच्च Score आणि ≥ {eng_min}.")
+        if entered:
+            r = best
+            pl = eng_plan(r, capital, risk_pct)
+            with st.container(border=True):
+                st.success(f'✅ ENTRY: {"🟢 LONG" if r["side"] == "UP" else "🔴 SHORT"} — **{r["sym"]}** · Score {r["score"]:.0f}/100 · {r["setup"]}')
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Entry (आत्ता)", f'{r["price"]:.6g}')
+                m2.metric("Stop-loss", f'{r["sl"]:.6g}', f'-{pl["sl_pct"]:.2f}%')
+                m3.metric("T1 (1R)", f'{r["t1"]:.6g}')
+                m4.metric(f"Target ({eng_rr}R)", f'{r["tp"]:.6g}')
+                m5.metric("Size (notional)", f'${pl["notional"]:,.0f}', f'{pl["lev"]:.1f}x lev')
+                st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}** ({risk_pct}% capital). T1 ला अर्धा नफा बुक करा, SL entry वर आणा.')
+                st.write(f'15m trend {r["htf"]}/25 · Trigger {r["trig"]}/25 · Momentum {r["mom"]}/20 · '
+                         f'Volume {r["vr"]:.2f}x · ADX {r["adx"]:.0f} · RSI {r["rsi"]:.0f} · Extension {r["ext"]:.2f} ATR · '
+                         f'Taker: {r.get("taker", "—")}')
+                if pl["lev"] > 10:
+                    st.warning(f'⚠ Leverage {pl["lev"]:.0f}x लागेल — SL जवळ आहे. जोखीम % कमी करा.')
+        else:
+            st.warning("NO ENTRY — थांबा. Score ≥ किमान असलेला एकही coin नाही. खाली सर्वात जवळचे आहेत.")
+        if eng:
+            st.dataframe(pd.DataFrame([{
+                "Coin": x["sym"], "Side": "🟢 LONG" if x["side"] == "UP" else "🔴 SHORT", "Score": x["score"],
+                "Setup": x["setup"], "15m": x["htf"], "Trigger": x["trig"], "Mom": x["mom"],
+                "Vol x": round(x["vr"], 2), "ADX": round(x["adx"]), "Ext ATR": round(x["ext"], 2),
+                "Price": x["price"], "SL": x["sl"], "Target": x["tp"]} for x in eng[:8]]),
+                hide_index=True, use_container_width=True)
+        else:
+            st.info("आत्ता कुठल्याच coin ला trend + trigger दोन्ही नाही.")
 
         if not df.empty:
             final = df[df.FINAL.isin(["UP", "DOWN"])].sort_values(["Confirms", "Momentum Score"],
@@ -923,36 +1096,6 @@ def scan_view():
             b.metric("FRESH momentum", len(df[df.State == "FRESH"]))
             c.metric("FINAL ata", len(df[df.FINAL.isin(["UP", "DOWN"])]))
             d_.metric("EXTENDED (late, baad)", len(df[df.State == "EXTENDED"]))
-
-            st.subheader("🎯 ENTRY — एकच CONFIRMED (सर्व gates पास)")
-            ent = df[df.ENTRY.isin(["UP", "DOWN"])]
-            if not ent.empty:
-                r = ent.iloc[0]
-                pl = entry_plan(float(live.get(r.Symbol, {}).get("price") or r.Price), float(r.ATR), r.ENTRY,
-                                sl_atr, tp_atr, capital, risk_pct)
-                with st.container(border=True):
-                    st.success(f'✅ ENTRY: {"🟢 LONG (UP)" if r.ENTRY == "UP" else "🔴 SHORT (DOWN)"} — **{r.Symbol}** · EScore {r.EScore:.0f}/100')
-                    if pl:
-                        m1, m2, m3, m4, m5 = st.columns(5)
-                        m1.metric("Entry", f'{pl["entry"]:.6g}')
-                        m2.metric("Stop-loss", f'{pl["sl"]:.6g}', f'-{pl["sl_pct"]:.2f}%')
-                        m3.metric("T1 (1R)", f'{pl["t1"]:.6g}')
-                        m4.metric("Target", f'{pl["tp"]:.6g}', f'RR 1:{pl["rr"]:.1f}')
-                        m5.metric("Size (notional)", f'${pl["notional"]:,.0f}', f'{pl["leverage"]:.1f}x lev')
-                        st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}** ({risk_pct}% capital). '
-                                 f'T1 ला अर्धा नफा बुक करून SL entry वर आणा.')
-                        if pl["leverage"] > 10:
-                            st.warning(f'⚠ Leverage {pl["leverage"]:.0f}x लागेल — SL अगदी जवळ आहे. जोखीम % कमी करा.')
-                    ok_, sc_, G_ = egates[r.Symbol]
-                    st.write(" · ".join(f'{"✅" if g[1] else "❌"} {g[0]}: {g[2]}' for g in G_))
-            else:
-                st.warning("NO ENTRY — थांबा. सर्व gates एकत्र पास झालेला एकही coin नाही.")
-                if egates:
-                    for sym_, (ok_, sc_, G_) in egates.items():
-                        bad = [f"{g[0]} ({g[2]})" for g in G_ if not g[1]]
-                        st.write(f"• **{sym_}**: FINAL आहे पण अडले → " + "; ".join(bad))
-                else:
-                    st.caption("FINAL signal च नाही, त्यामुळे entry चा प्रश्नच नाही.")
 
             st.subheader("🏆 FINAL — Signal + Fresh Momentum + SMC + DMI/KST/VI cross (ata)")
             if final.empty:
