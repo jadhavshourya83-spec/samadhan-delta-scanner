@@ -342,8 +342,38 @@ assert L.consensus({"a": "UP", "b": None, "c": None, "d": None})[0] == "WAIT"
 assert L.consensus({"a": "UP", "b": "UP", "c": "DOWN", "d": None})[0] == "WAIT"        # 2 vs 1 = virodh
 assert L.consensus({"a": "UP", "b": "UP", "c": "UP", "d": "DOWN"})[0] == "UP"         # 3 vs 1 chalel
 assert L.consensus({"a": "DOWN", "b": "DOWN", "c": None, "d": None})[0] == "DOWN"
+assert L.consensus({"a": "UP", "b": "UP", "c": None, "d": None}, 3)[0] == "WAIT"        # min_agree=3
+assert L.consensus({"a": "UP", "b": "UP", "c": "UP", "d": None}, 3)[0] == "UP"
+assert L.consensus({"a": "UP", "b": "UP", "c": "UP", "d": None}, 4)[0] == "WAIT"
+assert L.consensus({"a": "UP", "b": "UP", "c": "UP", "d": "UP"}, 4)[0] == "UP"
 assert L.chart_vote({"direction": "UP", "checks": []}) == "UP"
 assert L.chart_vote({"direction": "WAIT", "leaning": "DOWN", "checks": [("x", True, ""), ("y", False, "")]}) == "DOWN"   # 1 ati baki
 assert L.chart_vote({"direction": "WAIT", "leaning": "DOWN", "checks": [("x", False, ""), ("y", False, "")]}) is None   # 2 baki
 print("21 OK sahmati / chart_vote")
+# 22) MCX id shodh (detailed ani compact stambh-prakar)
+import pandas as _pd
+rows = [
+ ["MCX", "M", "FUTCOM", 111, "CRUDEOIL", "CRUDEOIL", "2026-11-19", 100, 0, "", 0],
+ ["MCX", "M", "FUTCOM", 112, "CRUDEOIL", "CRUDEOIL", "2026-12-21", 100, 0, "", 0],
+ ["MCX", "M", "OPTFUT", 9001, "CRUDEOIL", "CRUDEOIL", "2026-11-12", 100, 5900, "CE", 111],
+ ["MCX", "M", "OPTFUT", 9002, "CRUDEOIL", "CRUDEOIL", "2026-11-12", 100, 5950, "CE", 111],
+ ["MCX", "M", "OPTFUT", 9003, "CRUDEOIL", "CRUDEOIL", "2026-11-12", 100, 6000, "PE", 111],
+ ["MCX", "M", "OPTFUT", 9004, "CRUDEOIL", "CRUDEOIL", "2026-12-14", 100, 6000, "PE", 112],
+ ["MCX", "M", "OPTFUT", 9100, "GOLD", "GOLD", "2026-11-25", 1, 120000, "CE", 222],
+ ["NSE", "D", "OPTIDX", 5, "NIFTY", "NIFTY", "2026-11-04", 75, 25000, "CE", 13],
+ ["MCX", "M", "OPTFUT", 9005, "CRUDEOIL", "CRUDEOIL", "2026-10-01", 100, 5900, "CE", 100],     # junya expiry
+]
+cols = ["EXCH_ID", "SEGMENT", "INSTRUMENT", "SECURITY_ID", "UNDERLYING_SYMBOL", "SYMBOL_NAME", "SM_EXPIRY_DATE", "LOT_SIZE", "STRIKE_PRICE", "OPTION_TYPE", "UNDERLYING_SECURITY_ID"]
+dfm = _pd.DataFrame(rows, columns=cols)
+r22 = L.find_commodity(dfm, "crudeoil", today="2026-10-29")
+assert r22["ok"] and r22["id"] == 111 and r22["lot"] == 100 and r22["step"] == 50.0 and r22["expiry"] == "2026-11-12", r22
+assert L.find_commodity(dfm, "GOLD", today="2026-10-29")["id"] == 222
+assert not L.find_commodity(dfm, "SILVER", today="2026-10-29")["ok"]
+comp = dfm.drop(columns=["UNDERLYING_SECURITY_ID", "UNDERLYING_SYMBOL"]).rename(columns={
+    "EXCH_ID": "SEM_EXM_EXCH_ID", "INSTRUMENT": "SEM_INSTRUMENT_NAME", "SECURITY_ID": "SEM_SMST_SECURITY_ID",
+    "SYMBOL_NAME": "SM_SYMBOL_NAME", "SM_EXPIRY_DATE": "SEM_EXPIRY_DATE", "LOT_SIZE": "SEM_LOT_UNITS", "STRIKE_PRICE": "SEM_STRIKE_PRICE"})
+r22b = L.find_commodity(comp, "CRUDEOIL", today="2026-10-29")
+assert r22b["ok"] and r22b["id"] == 111 and "FUTURE" in r22b["how"], r22b          # compact: nearest FUTURE (option expiry nantar)
+assert not L.find_commodity(_pd.DataFrame({"a": [1]}), "X")["ok"]
+print("22 OK MCX shodh:", r22["id"], r22["lot"], r22["step"], r22["expiry"], "| compact:", r22b["id"])
 print("\nSAGLYA CHACHNYA PASS")
