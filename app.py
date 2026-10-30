@@ -56,6 +56,15 @@ with st.sidebar:
     req_oi = st.checkbox("OI direction la support karto (build-up) required", False)
     min_conf = st.slider("ticked पैकी किमान किती पुष्टी जुळाव्यात (0 = सगळ्या)", 0, 5, 0, 1,
                          help="सगळ्या पुष्टी एकत्र जुळणे दुर्मिळ आहे. 3 केल्यास ticked पैकी कोणत्याही 3 जुळल्या तरी चालेल.")
+    st.subheader("Stage 4 — एकच CONFIRMED ENTRY")
+    capital = st.number_input("Capital ($)", 10.0, value=1000.0, step=100.0)
+    risk_pct = st.slider("प्रति trade जोखीम % (SL लागल्यास)", 0.25, 3.0, 1.0, 0.25)
+    e_conf = st.slider("ENTRY साठी किमान पुष्टी (5 पैकी)", 2, 5, 4, 1)
+    e_vol = st.slider("किमान Volume x (median च्या)", 1.0, 3.0, 1.5, 0.1)
+    e_adx = st.slider("ENTRY साठी किमान ADX", 15, 35, 22, 1)
+    e_ext = st.slider("कमाल extension (ATR) - पाठलाग नको", 0.5, 3.0, 1.5, 0.25)
+    req_htf = st.checkbox("15m trend जुळला पाहिजे (EMA20/50)", True)
+    req_taker = st.checkbox("Taker flow दिशेशी जुळला पाहिजे", True)
     st.subheader("Saved signals (paper-trade)")
     sl_atr = st.slider("Stop-loss = kiti ATR", 0.5, 3.0, 1.5, 0.25)
     tp_atr = st.slider("Target = kiti ATR", 1.0, 6.0, 3.0, 0.5)
@@ -456,6 +465,90 @@ def chip(val, direction):
     return "✅" if (val == direction and direction in ("UP", "DOWN")) else "❌"
 
 
+# ───────────────────────── STAGE 4 : एकच CONFIRMED ENTRY ─────────────────────────
+# FINAL (5m fresh breakout + indicator crosses) -> pudhe ya gates sagle pass zale tarach ENTRY.
+# Sagle gates pass zalelyat jyacha EScore jast to ekach ENTRY dakhavla jato.
+def htf_trend(sym):
+    """15m trend: price > EMA20 > EMA50 = UP, ulat = DOWN, baki '-'. Data nasel tar None."""
+    try:
+        d = candles(sym, "15m", 120)
+        if len(d) < 60:
+            return None
+        c = d.close
+        e20, e50 = c.ewm(span=20, adjust=False).mean(), c.ewm(span=50, adjust=False).mean()
+        p = float(c.iloc[-1])
+        if p > e20.iloc[-1] > e50.iloc[-1]:
+            return "UP"
+        if p < e20.iloc[-1] < e50.iloc[-1]:
+            return "DOWN"
+        return "-"
+    except Exception:
+        return None
+
+
+def entry_gates(r, tk, htf, turnover, P):
+    """r: FINAL row (dict/Series). Return (ok, score, gates[(naav, ok, text)])."""
+    d = r["FINAL"]
+    up = d == "UP"
+    G = []
+    G.append(("पुष्टी", r["Confirms"] >= P["conf"], f'{int(r["Confirms"])}/5 (किमान {P["conf"]})'))
+    G.append(("Volume", r["Volume x Median"] >= P["vol"], f'{r["Volume x Median"]:.2f}x (किमान {P["vol"]}x)'))
+    G.append(("ADX", r["ADX"] >= P["adx"], f'{r["ADX"]:.0f} (किमान {P["adx"]})'))
+    G.append(("Extension", r["Extension (ATR)"] <= P["ext"], f'{r["Extension (ATR)"]:.2f} ATR (कमाल {P["ext"]})'))
+    fnd = r["Funding"]
+    crowded = fnd >= P["crowd"] if up else fnd <= -P["crowd"]
+    G.append(("Funding गर्दी नाही", not crowded, f"funding {fnd:.3f}"))
+    G.append(("Turnover पातळ नाही", turnover >= P["thin"], f"${turnover:,.0f}"))
+    tk_ok = bool(tk and tk.get("ok"))
+    share = tk["buy_share"] if tk_ok else None
+    tk_align = tk_ok and ((share >= 0.55) if up else (share <= 0.45))
+    G.append(("Taker flow", tk_align if P["req_taker"] else True,
+              f"खरेदी {share * 100:.0f}%" if tk_ok else "डेटा नाही"))
+    htf_ok = htf == d
+    G.append(("15m trend", htf_ok if P["req_htf"] else True, f"15m: {htf if htf else 'डेटा नाही'}"))
+    ok = all(g[1] for g in G)
+    score = (40 * min(1.0, r["Confirms"] / 5)
+             + 20 * min(1.0, max(0.0, (r["Volume x Median"] - 1) / 1.5))
+             + 15 * min(1.0, max(0.0, (r["ADX"] - 15) / 20))
+             + 15 * max(0.0, 1 - r["Extension (ATR)"] / max(P["ext"], 0.1))
+             + (10 if tk_align else 0))
+    return ok, round(score, 1), G
+
+
+def entry_plan(price, atr, d, sl_atr, tp_atr, capital, risk_pct):
+    """SL = sl_atr*ATR, T1 = 1R, TP = tp_atr*ATR. Size = risk$ / SL%."""
+    sign = 1 if d == "UP" else -1
+    sl_d = sl_atr * atr
+    if price <= 0 or sl_d <= 0:
+        return None
+    risk_usd = capital * risk_pct / 100
+    notional = risk_usd / (sl_d / price)
+    return {"entry": price, "sl": price - sign * sl_d, "t1": price + sign * sl_d,
+            "tp": price + sign * tp_atr * atr, "rr": tp_atr / sl_atr, "risk_usd": risk_usd,
+            "notional": notional, "leverage": notional / capital if capital > 0 else 0,
+            "sl_pct": sl_d / price * 100}
+
+
+def apply_entry(df, live):
+    """df madhe ENTRY / EScore kolumn bhara. Fakt ek (sarvat changla) ENTRY thevto."""
+    P = {"conf": e_conf, "vol": e_vol, "adx": e_adx, "ext": e_ext, "crowd": crowd_thr,
+         "thin": thin_turnover, "req_taker": req_taker, "req_htf": req_htf}
+    df["ENTRY"], df["EScore"] = "NO", 0.0
+    details, passed = {}, []
+    for i, r in df[df.FINAL.isin(["UP", "DOWN"])].iterrows():
+        tk = taker_flow(r.Symbol)
+        htf = htf_trend(r.Symbol)
+        ok, sc, G = entry_gates(r, tk, htf, live.get(r.Symbol, {}).get("turnover", 0.0), P)
+        df.at[i, "EScore"] = sc
+        details[r.Symbol] = (ok, sc, G)
+        if ok:
+            passed.append((sc, i))
+    if passed:
+        _, best = max(passed)
+        df.at[best, "ENTRY"] = df.at[best, "FINAL"]
+    return df, details
+
+
 # ───────────────────────── OI HISTORY + OPERATOR FOOTPRINTS ─────────────────────────
 # Prati scan prati coin cha (vel, price, OI value, funding) lakshat theto (session madhe, max 3 tas).
 # OI "contracts" = oi_value_usd / price  -> price badalla tari OI chi khari vadh dakhavto.
@@ -671,14 +764,14 @@ def update_tracker(df, live):
     active = {(v["symbol"], v["dir"]) for v in T.values() if v["status"] == "ACTIVE"}
 
     if not df.empty:
-        for _, r in df[df.FINAL.isin(["UP", "DOWN"])].iterrows():
-            seen.add((r.Symbol, r.FINAL))
-            if (r.Symbol, r.FINAL) in active:
+        for _, r in df[df.ENTRY.isin(["UP", "DOWN"])].iterrows():
+            seen.add((r.Symbol, r.ENTRY))
+            if (r.Symbol, r.ENTRY) in active:
                 continue
             entry = live.get(r.Symbol, {}).get("price") or float(r.Price)
-            sign = 1 if r.FINAL == "UP" else -1
-            T[f"{r.Symbol}|{r.FINAL}|{int(now)}"] = {
-                "symbol": r.Symbol, "dir": r.FINAL, "t": now, "entry": entry,
+            sign = 1 if r.ENTRY == "UP" else -1
+            T[f"{r.Symbol}|{r.ENTRY}|{int(now)}"] = {
+                "symbol": r.Symbol, "dir": r.ENTRY, "t": now, "entry": entry,
                 "sl": entry - sign * sl_atr * float(r.ATR), "tp": entry + sign * tp_atr * float(r.ATR),
                 "sig": float(r["Signal Score"]), "mom": int(r["Momentum Score"]),
                 "oi_meaning": r["OI Meaning"], "oi_pct": float(r["OI Change 6h %"]),
@@ -812,7 +905,12 @@ def scan_view():
                           ((df.FINAL == "DOWN") & (df.Funding <= -crowd_thr))
                 df.loc[crowded, "FINAL"] = "NO"
 
-        T = update_tracker(df, live)      # navin FINAL save kara, junyanchi live price/SL/TP update kara
+        if not df.empty:
+            df, egates = apply_entry(df, live)
+        else:
+            egates = {}
+
+        T = update_tracker(df, live)      # navin ENTRY save kara, junyanchi live price/SL/TP update kara
 
         if not df.empty:
             final = df[df.FINAL.isin(["UP", "DOWN"])].sort_values(["Confirms", "Momentum Score"],
@@ -825,6 +923,36 @@ def scan_view():
             b.metric("FRESH momentum", len(df[df.State == "FRESH"]))
             c.metric("FINAL ata", len(df[df.FINAL.isin(["UP", "DOWN"])]))
             d_.metric("EXTENDED (late, baad)", len(df[df.State == "EXTENDED"]))
+
+            st.subheader("🎯 ENTRY — एकच CONFIRMED (सर्व gates पास)")
+            ent = df[df.ENTRY.isin(["UP", "DOWN"])]
+            if not ent.empty:
+                r = ent.iloc[0]
+                pl = entry_plan(float(live.get(r.Symbol, {}).get("price") or r.Price), float(r.ATR), r.ENTRY,
+                                sl_atr, tp_atr, capital, risk_pct)
+                with st.container(border=True):
+                    st.success(f'✅ ENTRY: {"🟢 LONG (UP)" if r.ENTRY == "UP" else "🔴 SHORT (DOWN)"} — **{r.Symbol}** · EScore {r.EScore:.0f}/100')
+                    if pl:
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("Entry", f'{pl["entry"]:.6g}')
+                        m2.metric("Stop-loss", f'{pl["sl"]:.6g}', f'-{pl["sl_pct"]:.2f}%')
+                        m3.metric("T1 (1R)", f'{pl["t1"]:.6g}')
+                        m4.metric("Target", f'{pl["tp"]:.6g}', f'RR 1:{pl["rr"]:.1f}')
+                        m5.metric("Size (notional)", f'${pl["notional"]:,.0f}', f'{pl["leverage"]:.1f}x lev')
+                        st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}** ({risk_pct}% capital). '
+                                 f'T1 ला अर्धा नफा बुक करून SL entry वर आणा.')
+                        if pl["leverage"] > 10:
+                            st.warning(f'⚠ Leverage {pl["leverage"]:.0f}x लागेल — SL अगदी जवळ आहे. जोखीम % कमी करा.')
+                    ok_, sc_, G_ = egates[r.Symbol]
+                    st.write(" · ".join(f'{"✅" if g[1] else "❌"} {g[0]}: {g[2]}' for g in G_))
+            else:
+                st.warning("NO ENTRY — थांबा. सर्व gates एकत्र पास झालेला एकही coin नाही.")
+                if egates:
+                    for sym_, (ok_, sc_, G_) in egates.items():
+                        bad = [f"{g[0]} ({g[2]})" for g in G_ if not g[1]]
+                        st.write(f"• **{sym_}**: FINAL आहे पण अडले → " + "; ".join(bad))
+                else:
+                    st.caption("FINAL signal च नाही, त्यामुळे entry चा प्रश्नच नाही.")
 
             st.subheader("🏆 FINAL — Signal + Fresh Momentum + SMC + DMI/KST/VI cross (ata)")
             if final.empty:
