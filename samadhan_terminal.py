@@ -755,20 +755,97 @@ def chart_vote(sig):
     return None
 
 
-def consensus(votes):
+def consensus(votes, min_agree=2):
     """votes = {'चार्ट': 'UP'|'DOWN'|None, ...}. Nirnay: kimaan 2 sahmat ani virodhi 0, kinva >=3 sahmat ani virodhi <=1.
     Hi bhavishyavani nahi; 'kiti engine ekmat' evdhech sangte."""
     up = [k for k, v in votes.items() if v == "UP"]
     dn = [k for k, v in votes.items() if v == "DOWN"]
     for d, agree, opp in (("UP", up, dn), ("DOWN", dn, up)):
-        if (len(agree) >= 2 and not opp) or (len(agree) >= 3 and len(opp) <= 1):
+        if (len(agree) >= min_agree and not opp) or (len(agree) >= max(3, min_agree) and len(opp) <= 1):
             return d, agree, opp
     return "WAIT", up if len(up) >= len(dn) else dn, dn if len(up) >= len(dn) else up
 
 
+# ───────── MCX commodity: Dhan instrument list madhun id/lot/strike-gap shodha ─────────
+MCX_COMMON = ["CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "GOLD", "GOLDM", "GOLDPETAL", "SILVER", "SILVERM", "SILVERMIC",
+              "COPPER", "ZINC", "ZINCMINI", "ALUMINIUM", "LEAD", "NICKEL"]
+
+
+def _col(df, names):
+    low = {str(c).strip().lower(): c for c in df.columns}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def find_commodity(df, name, today=None):
+    """Dhan scrip-master (compact kinva detailed) madhun commodity chya option-chain sathi underlying id, lot, strike-gap.
+    Underlying = option contract chya UNDERLYING_SECURITY_ID (detailed file); nasel tar nearest FUTURE cha security id.
+    Kahihi na milyas None + karan."""
+    today = pd.Timestamp(today or datetime.now()).normalize()
+    c_ex, c_id = _col(df, ["EXCH_ID", "SEM_EXM_EXCH_ID"]), _col(df, ["SECURITY_ID", "SEM_SMST_SECURITY_ID"])
+    c_in, c_exp = _col(df, ["INSTRUMENT", "SEM_INSTRUMENT_NAME"]), _col(df, ["SM_EXPIRY_DATE", "SEM_EXPIRY_DATE"])
+    c_sym = [c for c in (_col(df, ["UNDERLYING_SYMBOL"]), _col(df, ["SYMBOL_NAME", "SM_SYMBOL_NAME"])) if c]
+    c_lot, c_k, c_und = _col(df, ["LOT_SIZE", "SEM_LOT_UNITS"]), _col(df, ["STRIKE_PRICE", "SEM_STRIKE_PRICE"]), _col(df, ["UNDERLYING_SECURITY_ID"])
+    if not (c_id and c_in and c_exp and c_sym):
+        return {"ok": False, "why": "instrument list madhe apekshit stambh (security id / instrument / expiry / symbol) sapadle nahit"}
+    d = df.copy()
+    if c_ex:
+        d = d[d[c_ex].astype(str).str.upper().str.strip() == "MCX"]
+    nm = name.strip().upper()
+    m = None
+    for c in c_sym:
+        mm = d[c].astype(str).str.upper().str.strip() == nm
+        m = mm if m is None else (m | mm)
+    d = d[m]
+    d = d.assign(_exp=pd.to_datetime(d[c_exp], errors="coerce")).dropna(subset=["_exp"])
+    d = d[d["_exp"] >= today]
+    if d.empty:
+        return {"ok": False, "why": f"MCX madhe '{name}' sathi chalu expiry asleli contracts sapadli nahit (naav barobar ahe ka?)"}
+    inst = d[c_in].astype(str).str.upper()
+    opts, futs = d[inst.str.startswith("OPT")], d[inst.str.startswith("FUT")]
+    if opts.empty:
+        return {"ok": False, "why": f"'{name}' sathi option contracts nahit (fakt FUTURE)"}
+    oexp = opts["_exp"].min()
+    o1 = opts[opts["_exp"] == oexp]
+    und = None
+    if c_und:
+        v = pd.to_numeric(o1[c_und], errors="coerce").dropna()
+        v = v[v > 0]
+        if len(v):
+            und = int(v.mode().iloc[0])
+    how = "option contract cha underlying id"
+    if und is None:
+        f2 = futs[futs["_exp"] >= oexp].sort_values("_exp")
+        if f2.empty:
+            f2 = futs.sort_values("_exp")
+        if f2.empty:
+            return {"ok": False, "why": "underlying FUTURE sapadla nahi"}
+        und, how = int(pd.to_numeric(f2.iloc[0][c_id])), "nearest FUTURE cha id"
+    lot = None
+    if c_lot:
+        lv = pd.to_numeric(o1[c_lot], errors="coerce").dropna()
+        lot = int(lv.mode().iloc[0]) if len(lv) else None
+    step = None
+    if c_k:
+        ks = sorted(set(pd.to_numeric(o1[c_k], errors="coerce").dropna()))
+        gaps = [b - a for a, b in zip(ks, ks[1:]) if b - a > 0]
+        step = float(pd.Series(gaps).mode().iloc[0]) if gaps else None
+    return {"ok": True, "id": und, "lot": lot, "step": step, "expiry": oexp.strftime("%Y-%m-%d"), "how": how}
+
+
 # ═════════════════════════════ PART 2: STREAMLIT UI ═════════════════════════════
 INDEX_MAP = {"NIFTY": dict(id=13, step=50, lot=65), "BANKNIFTY": dict(id=25, step=100, lot=30),
-             "SENSEX": dict(id=51, step=100, lot=20)}
+             "SENSEX": dict(id=51, step=100, lot=20),
+             "कमोडिटी (MCX, हाताने भरा)": dict(id=0, step=1, lot=1, custom=True)}
+
+
+def eod_time(window_end):
+    """Vyapar-bandi chya 20 minute nantar sagle open trade EXPIRED (index sathi 15:00 -> 15:20)."""
+    h, m = map(int, window_end.split(":"))
+    tot = min(h * 60 + m + 20, 23 * 60 + 59)
+    return dtime(tot // 60, tot % 60)
 
 
 def main():
@@ -784,6 +861,20 @@ def main():
 
     IST = timezone(timedelta(hours=5, minutes=30))
     JOURNAL = Path(__file__).with_name("entry_journal.json")
+
+    @st.cache_data(ttl=43200, show_spinner="Dhan instrument list उतरवत आहे (मोठी फाईल, पहिल्यांदा थोडा वेळ)...")
+    def load_scrip_master():
+        import io
+        last = None
+        for url in ("https://images.dhan.co/api-data/api-scrip-master-detailed.csv",
+                    "https://images.dhan.co/api-data/api-scrip-master.csv"):
+            try:
+                r = requests.get(url, timeout=90)
+                r.raise_for_status()
+                return pd.read_csv(io.StringIO(r.text), low_memory=False)
+            except Exception as e:
+                last = e
+        raise RuntimeError(last)
 
     @st.cache_resource(show_spinner=False)
     def get_v40_code(path):
@@ -803,16 +894,44 @@ def main():
         return os.environ.get(name)
 
     with st.sidebar:
-        sym = st.selectbox("Index", list(INDEX_MAP), index=0)
-        meta = INDEX_MAP[sym]
+        sym = st.selectbox("Index / कमोडिटी", list(INDEX_MAP), index=0)
+        meta = dict(INDEX_MAP[sym])
+        meta.setdefault("seg", "IDX_I")
+        meta.setdefault("csym", sym)
+        meta.setdefault("cexch", "INDEX")
+        if meta.get("custom"):
+            cname_sel = st.selectbox("कमोडिटी", MCX_COMMON + ["इतर (नाव लिहा)"], 0)
+            cname = (st.text_input("नाव (Dhan symbol)", "").strip().upper() if cname_sel.startswith("इतर") else cname_sel)
+            sym = cname or "COMMODITY"
+            found = st.session_state.get("mcx_found", {}).get(sym)
+            if st.button("🔎 Dhan list वरून id, lot, strike-gap शोधा"):
+                try:
+                    st.session_state.setdefault("mcx_found", {})[sym] = find_commodity(load_scrip_master(), sym)
+                except Exception as e_:
+                    st.session_state.setdefault("mcx_found", {})[sym] = {"ok": False, "why": f"instrument list उतरवता आली नाही: {e_}"}
+                found = st.session_state["mcx_found"][sym]
+            if found:
+                if found["ok"]:
+                    st.success(f"सापडले: id {found['id']} ({found['how']}) · lot {found['lot']} · strike-gap {found['step']} · जवळचा expiry {found['expiry']}")
+                else:
+                    st.warning(found["why"] + " : खाली हाताने भरा.")
+            okf = found if (found and found["ok"]) else {}
+            meta["id"] = int(st.number_input("Underlying security id (शोधले नाही तर हाताने)", 0, 100000000,
+                                             int(okf.get("id") or 0), 1, key=f"cm_id_{sym}_{okf.get('id')}"))
+            meta["seg"] = st.text_input("option chain segment", "MCX_COMM").strip()
+            meta["csym"] = st.text_input("चार्ट symbol (Tradehull)", sym).strip()
+            meta["cexch"] = st.text_input("चार्ट exchange (Tradehull)", "MCX").strip()
+            meta["step"] = float(st.number_input("Strike अंतर", 0.05, 100000.0, float(okf.get("step") or 50.0), 0.05,
+                                                 key=f"cm_step_{sym}_{okf.get('step')}"))
+            meta["lot"] = int(okf.get("lot") or 1)
         st.subheader("💰 भांडवल व जोखीम")
         capital = st.number_input("भांडवल (₹)", 10000, 100000000, 100000, 10000)
         risk_pct = st.slider("एका ट्रेडमध्ये जोखीम %", 0.25, 3.0, 1.0, 0.25)
-        lot_size = st.number_input(f"{sym} lot size (broker वर तपासा)", 1, 5000, meta["lot"], 1)
+        lot_size = st.number_input(f"{sym} lot size (broker वर तपासा)", 1, 100000, meta["lot"], 1)
         strike_mode = st.selectbox("Strike", ["ATM", "1 ITM (जास्त delta, जास्त premium)"], 0)
         st.subheader("⏱ वेळ")
-        w_start = st.text_input("ट्रेड सुरू (HH:MM)", "09:30")
-        w_end = st.text_input("ट्रेड बंद (HH:MM)", "15:00")
+        w_start = st.text_input("ट्रेड सुरू (HH:MM)", "09:30" if not meta.get("custom") else "09:15")
+        w_end = st.text_input("ट्रेड बंद (HH:MM)", "15:00" if not meta.get("custom") else "23:00")
         cooldown = st.slider("त्याच दिशेचा पुढचा सिग्नल किमान (मिनिटे)", 5, 60, 15, 5)
         st.subheader("🌊 OI flow")
         flow_gate = st.checkbox("OI flow विरोधात असेल तर थांबा", False)
@@ -821,10 +940,16 @@ def main():
             cas_strong = st.slider("STRONG score किमान", 50, 95, 70, 5)
             cas_late = st.slider("spot इतका हलला तर 'LATE' %", 0.1, 1.0, 0.40, 0.05)
         run_v40_on = st.checkbox("V40.2 OI इंजिन (तुमचा कोड) चालवा", True)
+        tf_min = int(st.selectbox("⏱ Candle (मिनिटे)", [5, 3, 1], 0,
+                                  help="लहान candle = सिग्नल लवकर पण जास्त खोटे. 3 किंवा 1 मिनिट Dhan/Tradehull ने समर्थित असावे (तपासलेले नाही). "
+                                       "चुकले तर 'Candle डेटा त्रुटी' दिसेल; 5 वर परत या."))
         mode = st.selectbox("🎚 सिग्नल कडकपणा", ["कडक (कमी, चांगले)", "मध्यम", "सैल (जास्त, कमजोर)"], 0,
                             help="कडक: ≥2 ताजे cross, तिन्ही एका बाजूला, volume 1.2x. मध्यम: 1 ताजा cross, 2/3 एका बाजूला, volume 1.0x. "
                                  "सैल: मध्यम + volume बंद + cross 4 candle पर्यंत. मध्यम/सैल निवडल्यास खालचे काही फिल्टर यांनी बदलले जातात. "
                                  "Journal मध्ये प्रत्येक entry चा कडकपणा नोंदला जातो, म्हणून कोणता चांगला ते 30+ निकालांनंतर पाहता येते.")
+        min_agree = int(st.selectbox("🤝 सहमती: किमान किती इंजिन एकमत", [2, 3, 4], 1,
+                                     help="चार इंजिन: चार्ट, OI flow, CAS, V40. 2 = सैल (आजचे सर्व तोट्याचे entries 2/4 होते). "
+                                          "3 = कडक (शिफारस), 4 = अतिकडक (क्वचित). विरोधात कुणी नसावे ही अट कायम."))
         with st.expander("⚙ प्रगत फिल्टर"):
             min_cross = st.slider("ताजे cross किमान (DMI/VI/KST पैकी)", 1, 3, 2)
             cross_n = st.slider("cross किती candle पर्यंत 'ताजा'", 1, 6, 3)
@@ -876,7 +1001,7 @@ def main():
         return val
 
     def fetch_chain(d_api, sec_id, expiry):
-        resp = d_api.option_chain(under_security_id=sec_id, under_exchange_segment="IDX_I", expiry=expiry)
+        resp = d_api.option_chain(under_security_id=sec_id, under_exchange_segment=meta["seg"], expiry=expiry)
         data = (resp or {}).get("data", {}).get("data") if isinstance(resp, dict) else None
         if not data or "oc" not in data:
             raise RuntimeError(f"option chain मिळाली नाही: {str(resp)[:200]}")
@@ -912,10 +1037,14 @@ def main():
             st.error(f"Dhan कनेक्शन त्रुटी: {e}")
             return
 
+        if meta["id"] <= 0:
+            st.info("कमोडिटी: sidebar मध्ये 'Underlying security id' (चालू महिन्याचे FUTURE चे Dhan id) भरा, मग हे सुरू होईल.")
+            return
+
         # 1) Expiry (dynamic)
         try:
             exp_list = cached(f"exp_{sym}", 600, lambda: extract_dates(
-                d_api.expiry_list(under_security_id=meta["id"], under_exchange_segment="IDX_I")))
+                d_api.expiry_list(under_security_id=meta["id"], under_exchange_segment=meta["seg"])))
         except Exception:
             exp_list = []
         today = now.strftime("%Y-%m-%d")
@@ -951,11 +1080,11 @@ def main():
 
         # 3) Candles (purna candle fakt)
         try:
-            raw = cached(f"h_{sym}", 20, lambda: tsl.get_historical_data(sym, "INDEX", "5"))
+            raw = cached(f"h_{sym}_{tf_min}", 20, lambda: tsl.get_historical_data(meta["csym"], meta["cexch"], str(tf_min)))
         except Exception as e:
             st.error(f"Candle डेटा त्रुटी: {e}")
             return
-        df, note = drop_forming_candle(raw, 5, now)
+        df, note = drop_forming_candle(raw, tf_min, now)
         sig = evaluate_signal(df, cfg)
         if sig["close"] and spot and abs(spot / sig["close"] - 1) > 0.015:
             st.error(f"⚠ Chain चा spot ({spot:,.0f}) आणि चार्टचा भाव ({sig['close']:,.0f}) जुळत नाहीत. "
@@ -993,7 +1122,7 @@ def main():
             ok = send_telegram(fmt_alert(sym, direction, expiry, opt, plan, sig, flow_txt))
             st.toast("Telegram: " + ("पाठवला" if ok else "पाठवला नाही (secrets तपासा)"))
 
-        eod = now.time() >= dtime(15, 20)
+        eod = now.time() >= eod_time(cfg.window_end)
         for t in st.session_state["journal"]:
             if t["sym"] == sym and t["expiry"] == expiry and t["status"] in OPEN_STATES:
                 update_trade(t, chain_ltp(oc, t["strike"], t["side"]), now_ts, eod, cfg.max_trade_minutes)
@@ -1169,7 +1298,7 @@ def main():
                  "OI flow": flow_dir,
                  "CAS": (None if not cas_strong else ("UP" if cas_strong["bias"] == "BULLISH" else "DOWN")),
                  "V40": (("UP" if v40_vs["type"] == "CE" else "DOWN") if v40_act else None)}
-        c_dir, c_agree, c_opp = consensus(votes)
+        c_dir, c_agree, c_opp = consensus(votes, min_agree)
         with top:
             vrow = {k: {"UP": "🟢 UP", "DOWN": "🔴 DOWN", None: "—"}[v] for k, v in votes.items()}
             if c_dir != "WAIT":
@@ -1194,7 +1323,7 @@ def main():
                     st.warning(f"सहमती {c_dir} ({', '.join(c_agree)}), पण option/योजना बनत नाही: "
                                + ("; ".join(copt.get("issues", [])) if not copt["ok"] else (cplan or {}).get("note", "")))
             else:
-                st.info("⏳ **सहमती नाही**: किमान 2 इंजिन एकाच दिशेला आणि कुणी विरोधात नसावे लागते.")
+                st.info(f"⏳ **सहमती नाही**: किमान {min_agree} इंजिन एकाच दिशेला आणि कुणी विरोधात नसावे लागते.")
             st.dataframe(pd.DataFrame([vrow]), hide_index=True, use_container_width=True)
             st.caption("चार्ट = पूर्ण सिग्नल किंवा फक्त 1 अट बाकी · OI flow = 2 मिनिटे टिकलेला · CAS = STRONG आणि LATE नाही · V40 = आत्ता सक्रिय सिग्नल. "
                        "जास्त इंजिन सहमत म्हणजे जास्त खात्रीशीर असे सिद्ध नाही; Journal मध्ये 'सहमती 2/4', '3/4' चे निकाल वेगळे पाहून ठरवा.")
