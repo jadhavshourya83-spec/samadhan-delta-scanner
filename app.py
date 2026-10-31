@@ -66,6 +66,8 @@ with st.sidebar:
     eng_oi = st.slider("किमान OI वाढ (6 तास, %)", 0.5, 5.0, 1.0, 0.5,
                        help="OI वाढतो = नवे सौदे उघडत आहेत. किंमत अजून शांत असताना OI वाढणे म्हणजे तयारी.")
     eng_cool = st.slider("SL लागल्यावर विश्रांती (मिनिटे)", 0, 180, 45, 15)
+    eng_strong = st.slider("'अतिमजबूत' Score — चालू trade/विश्रांती असूनही दाखवा", 70, 100, 80, 2,
+                           help="चालू trade असताना याच्यापेक्षा जास्त Score चा नवीन ENTRY आला तर तो दिसेल. नाहीतर फक्त निरीक्षण.")
     eng_min_sl = st.slider("किमान SL अंतर % (त्याखाली SL नको)", 0.3, 2.0, 0.6, 0.1,
                            help="खूप जवळचा SL spread/noise मध्येच लागतो आणि size अवाढव्य होतो.")
     eng_lev = st.slider("कमाल leverage (size मर्यादा)", 1.0, 20.0, 5.0, 1.0)
@@ -79,7 +81,7 @@ with st.sidebar:
     st.subheader("Saved signals (paper-trade)")
     sl_atr = st.slider("Stop-loss = kiti ATR", 0.5, 3.0, 1.5, 0.25)
     tp_atr = st.slider("Target = kiti ATR", 1.0, 6.0, 3.0, 0.5)
-    keep_hours = st.slider("Signal kiti tas 'ACTIVE' theva", 1, 48, 12, 1)
+    keep_hours = st.slider("Signal kiti tas 'ACTIVE' theva (junya trade ni jaga advu naye)", 0.5, 24.0, 2.0, 0.5)
     if st.button("🗑 Saved signals clear kara"):
         st.session_state["tracked"] = {}
         save_log({})
@@ -1187,8 +1189,9 @@ def scan_view():
         last_sl = max([v_["t"] for v_ in T0.values() if v_["status"] == "SL HIT"], default=0.0)
         rest_min = (eng_cool * 60 - (time.time() - last_sl)) / 60
         locked = bool(act_tr) or rest_min > 0
-        if locked:
-            entered = False                           # ek veli ek trade: chalu aslyas / SL nantar vishranti madhe navin nako
+        strong = bool(best and best["score"] >= eng_strong)
+        if locked and not strong:
+            entered = False                           # chalu trade / vishranti madhe fakt 'atimajboot' (strong) navin ENTRY dakhva
         df_e = pd.DataFrame()
         if entered:
             pe = live.get(best["sym"], {}).get("price") or best["price"]
@@ -1204,6 +1207,12 @@ def scan_view():
             r = best
             pl = eng_plan(r, capital, risk_pct, eng_lev)
             with st.container(border=True):
+                if locked:
+                    st.warning("⚡ आधीची trade चालू आहे / विश्रांती आहे, पण हा **अतिमजबूत** Score मुळे दाखवला आहे. आधीची trade तपासा.")
+                _m = r["mom"]
+                st.write(f'💨 **Momentum: {"🟢 मजबूत" if _m >= 17 else ("🟡 मध्यम" if _m >= 13 else "🟠 कमकुवत")}** ({_m}/20) — '
+                         f'ADX वाढत आहे ({r["adx"]:.0f}), RSI {r["rsi"]:.0f}, Volume {r["vr"]:.2f}x. '
+                         f'Momentum गेला तर (ADX खाली, किंमत SL च्या जवळ, volume आटला) तर बाहेर पडा.')
                 st.success(f'✅ ENTRY: {"🟢 LONG" if r["side"] == "UP" else "🔴 SHORT"} — **{r["sym"]}** · Score {r["score"]:.0f}/100 · {r["setup"]}')
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Entry (आत्ता)", f'{r["price"]:.6g}')
@@ -1226,9 +1235,10 @@ def scan_view():
         else:
             if act_tr:
                 a_ = act_tr[0]
-                st.info(f'⏸ एक trade आधीच चालू आहे: **{a_["symbol"]} {"LONG" if a_["dir"] == "UP" else "SHORT"}** · '
+                st.info(f'⏸ एक trade चालू आहे: **{a_["symbol"]} {"LONG" if a_["dir"] == "UP" else "SHORT"}** · '
                         f'entry {a_["entry"]:.6g} · आत्ता {a_["last"]:.6g} · P/L {a_["pnl"]:.2f}% · SL {a_["sl"]:.6g} · TP {a_["tp"]:.6g}. '
-                        f'ती संपेपर्यंत नवीन ENTRY नाही (गोंधळ टाळण्यासाठी).')
+                        f'नवीन ENTRY फक्त Score ≥ {eng_strong} (अतिमजबूत) असेल तरच येईल. खाली सर्वोत्तम निरीक्षण: '
+                        + (f'{best["sym"]} {"LONG" if best["side"] == "UP" else "SHORT"} Score {best["score"]:.0f}' if best else "काहीच नाही") + ".")
             elif rest_min > 0:
                 st.info(f"⏸ SL नंतर विश्रांती: आणखी {rest_min:.0f} मिनिटे नवीन ENTRY नाही.")
             else:
