@@ -62,7 +62,10 @@ with st.sidebar:
     eng_n = st.slider("इंजिन: किती coins तपासायचे (turnover नुसार टॉप)", 10, 60, 30, 5)
     eng_min = st.slider("ENTRY साठी किमान Score (0-100)", 50, 90, 68, 2,
                         help="कमी = जास्त entries पण कमी दर्जा. जास्त = कमी पण कडक.")
-    eng_adx = st.slider("इंजिन: किमान ADX (trend ताकद)", 12, 30, 18, 1)
+    eng_adx = st.slider("इंजिन: किमान ADX (वाढत असलेला)", 10, 30, 15, 1)
+    eng_oi = st.slider("किमान OI वाढ (6 तास, %)", 0.5, 5.0, 1.0, 0.5,
+                       help="OI वाढतो = नवे सौदे उघडत आहेत. किंमत अजून शांत असताना OI वाढणे म्हणजे तयारी.")
+    eng_cool = st.slider("SL लागल्यावर विश्रांती (मिनिटे)", 0, 180, 45, 15)
     eng_min_sl = st.slider("किमान SL अंतर % (त्याखाली SL नको)", 0.3, 2.0, 0.6, 0.1,
                            help="खूप जवळचा SL spread/noise मध्येच लागतो आणि size अवाढव्य होतो.")
     eng_lev = st.slider("कमाल leverage (size मर्यादा)", 1.0, 20.0, 5.0, 1.0)
@@ -690,6 +693,78 @@ def coil_watch(d5, d15, oi_pct=0.0, min_atr_pct=0.12):
     return None
 
 
+def pre_break_score(d5, d15, oi_pct=0.0, funding=0.0, crowd=0.03, rr=2.0, min_atr_pct=0.12, min_sl_pct=0.6,
+                    adx_min=15.0, oi_min=1.0, fee_rt=0.12, ext_max=1.25):
+    """BREAKOUT ADHI (ajun zala nahi) + momentum suru + OI vadhto. Dishaa = 15m trend. Score 0-100:
+       15m trend 25 | coil (shanti + range kadhachya javal) 20 | momentum suru 20 | volume vadh 10 | OI 20 (+taker 5 nantar)
+       HARD: breakout ajun nahi, OI >= oi_min % (6h), ADX >= adx_min ani vadhto, extension <= ext_max."""
+    if len(d5) < 60 or len(d15) < 55:
+        return None
+    c, h, l_, v = d5.close, d5.high, d5.low, d5.volume.fillna(0)
+    e20 = c.ewm(span=20, adjust=False).mean()
+    pdi, mdi, adx, atr_s = dmi_vals(d5)
+    rsi = rsi_series(c)
+    atr, price = float(atr_s.iloc[-1]), float(c.iloc[-1])
+    if atr <= 0 or price <= 0 or atr / price * 100 < min_atr_pct or float((v.iloc[-30:] <= 0).mean()) > 0.2:
+        return None
+    base = float(v.iloc[-43:-3].median())
+    if base <= 0 or oi_pct < oi_min:
+        return None
+    vr = min(5.0, float(v.iloc[-3:].mean()) / base)
+    ext = abs(price - float(e20.iloc[-1])) / atr
+    if ext > ext_max or float(adx.iloc[-1]) < adx_min or float(adx.iloc[-1]) <= float(adx.iloc[-4]):
+        return None
+    c15 = d15.close
+    t20, t50 = c15.ewm(span=20, adjust=False).mean(), c15.ewm(span=50, adjust=False).mean()
+    p15 = float(c15.iloc[-1])
+    if p15 > t50.iloc[-1] and t20.iloc[-1] > t50.iloc[-1]:
+        side = "UP"
+    elif p15 < t50.iloc[-1] and t20.iloc[-1] < t50.iloc[-1]:
+        side = "DOWN"
+    else:
+        return None
+    up = side == "UP"
+    sg = 1 if up else -1
+    hi, lo = float(h.iloc[-21:-1].max()), float(l_.iloc[-21:-1].min())
+    level = hi if up else lo
+    if (up and float(c.iloc[-1]) > hi) or (not up and float(c.iloc[-1]) < lo):
+        return None                                            # breakout zala = ata ha ENTRY prakar nahi
+    dist_lvl = ((hi - price) if up else (price - lo)) / atr
+    if dist_lvl > 0.8:
+        return None                                            # range kadhapasun dur = ajun tayari nahi
+    tr_ = true_range(d5)
+    sq = float(tr_.iloc[-13:-3].mean()) / max(float(tr_.iloc[-50:].mean()), 1e-12)
+    coil = 10 * max(0.0, min(1.0, (1.0 - sq) / 0.3 + 0.5)) + 10 * (1 - dist_lvl / 0.8)
+    di_ok = (pdi.iloc[-1] > mdi.iloc[-1]) if up else (pdi.iloc[-1] < mdi.iloc[-1])
+    if not di_ok:
+        return None                                            # momentum dishela nahi
+    steps = (l_.iloc[-1] > l_.iloc[-4]) if up else (h.iloc[-1] < h.iloc[-4])     # higher lows / lower highs
+    mom = 6 + 7 + (4 if ((50 <= rsi.iloc[-1] <= 68) if up else (32 <= rsi.iloc[-1] <= 50)) else 0) + (3 if steps else 0)
+    volp = 10 * min(1.0, max(0.0, (vr - 0.8) / 0.8))
+    # BHID (kon jast adakla): perpetual madhe long OI = short OI, tyamule bajuvar vibhajan public nahi.
+    # Funding cha chinha = bhid konchi: + => long jast (longs paise detat), - => short jast. OI vadhtoy + kimat shant = hi bhid adakleli.
+    mild = crowd * 0.5
+    crowd_same = (up and funding >= mild) or (not up and funding <= -mild)     # bhid amchya bajula = tyanna adkavnyacha dhoka
+    crowd_opp = (up and funding <= -mild) or (not up and funding >= mild)      # bhid ulat bajula = tyanchi SL-hunt / squeeze indhan
+    if crowd_same:
+        return None
+    oip = 20 * min(1.0, oi_pct / 3.0) * (1.0 if crowd_opp else 0.5)
+    crowd_txt = ("शॉर्ट गर्दी (भीड) → वरचा squeeze इंधन" if up else "लाँग गर्दी (भीड) → खालचा धक्का इंधन") if crowd_opp \
+        else "गर्दी स्पष्ट नाही (OI गुण अर्धे)"
+    score = min(100.0, 25 + coil + mom + volp + oip)
+    sw = float(l_.iloc[-12:].min()) - 0.2 * atr if up else float(h.iloc[-12:].max()) + 0.2 * atr
+    dist = min(max(abs(price - sw), 1.5 * atr), 3.0 * atr)
+    dist = max(dist, price * min_sl_pct / 100)
+    sl_p = dist / price * 100
+    if dist > 4 * atr or (rr * sl_p - fee_rt) / (sl_p + fee_rt) < 1.4:
+        return None
+    return {"side": side, "score": round(score, 1),
+            "setup": f"breakout आधी: लेव्हल {level:.6g} (अंतर {dist_lvl:.2f} ATR) · शांती {sq:.2f} · OI {oi_pct:+.1f}%",
+            "htf": 25, "trig": round(coil, 1), "mom": mom, "oi": round(oip, 1), "crowd": crowd_txt, "funding": funding, "vr": vr, "adx": float(adx.iloc[-1]),
+            "rsi": float(rsi.iloc[-1]), "ext": ext, "atr": atr, "price": price, "level": level, "sqz": sq,
+            "sl": price - sg * dist, "t1": price + sg * dist, "tp": price + sg * rr * dist, "dist": dist}
+
+
 def engine_scan(live, pinned, n, rr):
     pool = sorted(((s, v) for s, v in live.items() if v.get("turnover", 0) >= min_turnover and v["price"] > 0),
                   key=lambda x: x[1]["turnover"], reverse=True)
@@ -701,8 +776,9 @@ def engine_scan(live, pinned, n, rr):
         try:
             d5, d15 = candles(sym, "5m", 150), candles(sym, "15m", 120)
             v = live.get(sym, {})
-            r = score_coin(d5, d15, v.get("oi_pct", 0.0), 0.0, v.get("funding", 0.0), crowd_thr, rr,
-                           min_atr_pct=0.12, min_sl_pct=eng_min_sl, adx_min=float(eng_adx), ext_max=float(e_ext))
+            r = pre_break_score(d5, d15, v.get("oi_pct", 0.0), v.get("funding", 0.0), crowd_thr, rr,
+                                min_atr_pct=0.12, min_sl_pct=eng_min_sl, adx_min=float(eng_adx),
+                                oi_min=float(eng_oi), ext_max=float(e_ext))
             w = coil_watch(d5, d15, v.get("oi_pct", 0.0))
             if w:
                 w["sym"] = sym
@@ -1106,6 +1182,13 @@ def scan_view():
             best["score"] = min(100.0, best["score"] + adj)
             best["taker"] = f'{tk_["buy_share"] * 100:.0f}% खरेदी ({adj:+d})' if tk_["ok"] else "डेटा नाही"
         entered = bool(best and best["score"] >= eng_min)
+        T0 = st.session_state["tracked"]
+        act_tr = [v_ for v_ in T0.values() if v_["status"] == "ACTIVE"]
+        last_sl = max([v_["t"] for v_ in T0.values() if v_["status"] == "SL HIT"], default=0.0)
+        rest_min = (eng_cool * 60 - (time.time() - last_sl)) / 60
+        locked = bool(act_tr) or rest_min > 0
+        if locked:
+            entered = False                           # ek veli ek trade: chalu aslyas / SL nantar vishranti madhe navin nako
         df_e = pd.DataFrame()
         if entered:
             pe = live.get(best["sym"], {}).get("price") or best["price"]
@@ -1116,7 +1199,7 @@ def scan_view():
         T = update_tracker(df_e, live)      # navin ENTRY save kara, junyanchi live price/SL/TP update kara
 
         st.subheader("🎯 ENTRY — एकच CONFIRMED (Samadhan Crypto Score)")
-        st.caption(f"{n_eng} coins तपासले (5m + 15m, फक्त closed candles). ENTRY = सर्वोच्च Score आणि ≥ {eng_min}.")
+        st.caption(f"{n_eng} coins तपासले (5m + 15m, फक्त closed candles). ENTRY = breakout आधीचा, OI वाढणारा, सर्वोच्च Score आणि ≥ {eng_min}. एकावेळी एकच trade.")
         if entered:
             r = best
             pl = eng_plan(r, capital, risk_pct, eng_lev)
@@ -1133,17 +1216,27 @@ def scan_view():
                 if pl["capped"]:
                     st.info(f'Leverage मर्यादा {eng_lev}x मुळे size कमी केला; म्हणून तोटा {risk_pct}% पेक्षा कमी आहे.')
                 st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}**. T1 ला अर्धा नफा बुक करा, SL entry वर आणा.')
-                st.write(f'15m trend {r["htf"]}/25 · Trigger {r["trig"]}/25 · Momentum {r["mom"]}/20 · '
+                st.write(f'15m trend {r["htf"]}/25 · Coil {r["trig"]}/20 · Momentum {r["mom"]}/20 · OI {r["oi"]}/20 · '
                          f'Volume {r["vr"]:.2f}x · ADX {r["adx"]:.0f} · RSI {r["rsi"]:.0f} · Extension {r["ext"]:.2f} ATR · '
                          f'Taker: {r.get("taker", "—")}')
+                st.write(f'👥 **भीड (funding {r.get("funding", 0):+.3f}):** {r.get("crowd", "—")}')
+                st.caption("Perpetual मध्ये long आणि short OI नेहमी बरोबर असतात, बाजूनुसार वाटणी public नाही. म्हणून भीड = funding चिन्ह (अंदाज), खात्रीची आकडेवारी नाही.")
                 if pl["lev"] > 10:
                     st.warning(f'⚠ Leverage {pl["lev"]:.0f}x लागेल — SL जवळ आहे. जोखीम % कमी करा.')
         else:
-            st.warning("NO ENTRY — थांबा. Score ≥ किमान असलेला एकही coin नाही. खाली सर्वात जवळचे आहेत.")
+            if act_tr:
+                a_ = act_tr[0]
+                st.info(f'⏸ एक trade आधीच चालू आहे: **{a_["symbol"]} {"LONG" if a_["dir"] == "UP" else "SHORT"}** · '
+                        f'entry {a_["entry"]:.6g} · आत्ता {a_["last"]:.6g} · P/L {a_["pnl"]:.2f}% · SL {a_["sl"]:.6g} · TP {a_["tp"]:.6g}. '
+                        f'ती संपेपर्यंत नवीन ENTRY नाही (गोंधळ टाळण्यासाठी).')
+            elif rest_min > 0:
+                st.info(f"⏸ SL नंतर विश्रांती: आणखी {rest_min:.0f} मिनिटे नवीन ENTRY नाही.")
+            else:
+                st.warning("NO ENTRY — थांबा. Score ≥ किमान, OI वाढणारा आणि breakout आधीचा एकही coin नाही. खाली सर्वात जवळचे आहेत.")
         if eng:
             st.dataframe(pd.DataFrame([{
                 "Coin": x["sym"], "Side": "🟢 LONG" if x["side"] == "UP" else "🔴 SHORT", "Score": x["score"],
-                "Setup": x["setup"], "15m": x["htf"], "Trigger": x["trig"], "Mom": x["mom"],
+                "Setup": x["setup"], "15m": x["htf"], "Coil": x["trig"], "Mom": x["mom"], "OI": x["oi"], "भीड": x.get("crowd", ""),
                 "Vol x": round(x["vr"], 2), "ADX": round(x["adx"]), "Ext ATR": round(x["ext"], 2),
                 "Price": x["price"], "SL": x["sl"], "Target": x["tp"]} for x in eng[:8]]),
                 hide_index=True, use_container_width=True)
