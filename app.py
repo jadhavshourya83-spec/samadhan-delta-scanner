@@ -62,6 +62,10 @@ with st.sidebar:
     eng_n = st.slider("इंजिन: किती coins तपासायचे (turnover नुसार टॉप)", 10, 60, 30, 5)
     eng_min = st.slider("ENTRY साठी किमान Score (0-100)", 50, 90, 68, 2,
                         help="कमी = जास्त entries पण कमी दर्जा. जास्त = कमी पण कडक.")
+    eng_adx = st.slider("इंजिन: किमान ADX (trend ताकद)", 12, 30, 18, 1)
+    eng_min_sl = st.slider("किमान SL अंतर % (त्याखाली SL नको)", 0.2, 1.5, 0.4, 0.1,
+                           help="खूप जवळचा SL spread/noise मध्येच लागतो आणि size अवाढव्य होतो.")
+    eng_lev = st.slider("कमाल leverage (size मर्यादा)", 1.0, 20.0, 5.0, 1.0)
     eng_rr = st.slider("Target = किती R (SL च्या पटीत)", 1.5, 4.0, 2.0, 0.5)
     e_conf = st.slider("(जुना gate) ENTRY साठी किमान पुष्टी (5 पैकी)", 2, 5, 4, 1)
     e_vol = st.slider("किमान Volume x (median च्या)", 1.0, 3.0, 1.5, 0.1)
@@ -574,7 +578,8 @@ def rsi_series(c, n=14):
     return 100 - 100 / (1 + g / l_.replace(0, np.nan))
 
 
-def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0):
+def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0,
+               min_atr_pct=0.12, min_sl_pct=0.4, adx_min=18.0):
     """d5/d15: closed-candle DataFrames. Return best side dict kinva None."""
     if len(d5) < 60 or len(d15) < 55:
         return None
@@ -586,11 +591,17 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
     price = float(c.iloc[-1])
     if atr <= 0 or price <= 0:
         return None
+    if atr / price * 100 < min_atr_pct:                    # coin ajibat halat nahi (flat / bandh market) -> SL/target arthhin
+        return None
+    if float((v.iloc[-30:] <= 0).mean()) > 0.2:            # volume nasalele candles jast -> illiquid / bandh
+        return None
     c15 = d15.close
     t20, t50 = c15.ewm(span=20, adjust=False).mean(), c15.ewm(span=50, adjust=False).mean()
     p15 = float(c15.iloc[-1])
     base = float(v.iloc[-43:-3].median())
-    vr = float(v.iloc[-3:].max()) / base if base > 0 else 0.0
+    if base <= 0:
+        return None
+    vr = min(5.0, float(v.iloc[-3:].max()) / base)          # 5x chya var mojat nahi (illiquid ratio phugvta)
     ext = abs(price - float(e20.iloc[-1])) / atr
     out = []
     for side in ("UP", "DOWN"):
@@ -600,7 +611,7 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
             htf = 25 if (p15 > t50.iloc[-1] and t20.iloc[-1] > t50.iloc[-1]) else (12 if p15 > t50.iloc[-1] else None)
         else:
             htf = 25 if (p15 < t50.iloc[-1] and t20.iloc[-1] < t50.iloc[-1]) else (12 if p15 < t50.iloc[-1] else None)
-        if htf is None or ext > 3.0:
+        if htf is None or ext > 3.0 or float(adx.iloc[-1]) < adx_min:
             continue
         # trigger
         trig, setup = 0, ""
@@ -608,8 +619,11 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
             i = len(c) - k
             lvl = float(h.iloc[i - 20:i].max()) if up else float(l_.iloc[i - 20:i].min())
             if (up and c.iloc[i] > lvl) or (not up and c.iloc[i] < lvl):
+                late = ((price - lvl) if up else (lvl - price)) / atr
+                if late > 1.5:                                 # breakout pasun 1.5 ATR pudhe = late, nako
+                    continue
                 if (up and price > lvl) or (not up and price < lvl):   # ajun tikla ahe
-                    trig, setup = 25, f"20-candle breakout ({k} candle purvi)"
+                    trig, setup = {1: 25, 2: 20, 3: 12}[k], f"20-candle breakout ({k} candle purvi)"
                     break
         if not trig:                                           # pullback bounce EMA20 var
             trend_ok = (e20.iloc[-1] > e50.iloc[-1]) if up else (e20.iloc[-1] < e50.iloc[-1])
@@ -630,15 +644,44 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
             ctx += 5
         if (up and funding >= crowd) or (not up and funding <= -crowd):
             ctx -= 5
-        score = htf + trig + mom + volp + extp + ctx
+        tr_ = true_range(d5)
+        sq = float(tr_.iloc[-13:-3].mean()) / max(float(tr_.iloc[-50:].mean()), 1e-12)
+        sqz = 5 if sq <= 0.85 else 0                           # breakout adhi shanti (squeeze) = bonus
+        score = min(100.0, htf + trig + mom + volp + extp + ctx + sqz)
         # SL: swing (gelya 10 candle) +/- 0.2 ATR, kamit 1 ATR, jastit jast 2.5 ATR
         sw = float(l_.iloc[-10:].min()) - 0.2 * atr if up else float(h.iloc[-10:].max()) + 0.2 * atr
         dist = min(max(abs(price - sw), 1.0 * atr), 2.5 * atr)
+        dist = max(dist, price * min_sl_pct / 100)              # SL kamit min_sl_pct % (spread/noise madhe udu naye)
+        if dist > 4 * atr:                                      # coin itka shant ki target gathane avghad
+            continue
         out.append({"side": side, "score": round(score, 1), "setup": setup, "htf": htf, "trig": trig,
                     "mom": mom, "vr": vr, "adx": float(adx.iloc[-1]), "rsi": float(rsi.iloc[-1]),
-                    "ext": ext, "atr": atr, "price": price, "sl": price - sg * dist,
+                    "ext": ext, "atr": atr, "price": price, "sqz": sqz, "sl": price - sg * dist,
                     "t1": price + sg * dist, "tp": price + sg * rr * dist, "dist": dist})
     return max(out, key=lambda x: x["score"]) if out else None
+
+
+def coil_watch(d5, d15, oi_pct=0.0, min_atr_pct=0.12):
+    """Move ADHI: shanti (squeeze) + 15m trend + price range kadhachya javal, pan breakout ajun nahi. Fakt 'tayari', khatri nahi."""
+    if len(d5) < 60 or len(d15) < 55:
+        return None
+    c, h, l_, v = d5.close, d5.high, d5.low, d5.volume.fillna(0)
+    tr_ = true_range(d5)
+    atr = float(wilder(tr_).iloc[-1]); price = float(c.iloc[-1])
+    if atr <= 0 or price <= 0 or atr / price * 100 < min_atr_pct or float((v.iloc[-30:] <= 0).mean()) > 0.2:
+        return None
+    sq = float(tr_.iloc[-13:-3].mean()) / max(float(tr_.iloc[-50:].mean()), 1e-12)
+    if sq > 0.8:
+        return None
+    c15 = d15.close
+    t20, t50 = c15.ewm(span=20, adjust=False).mean(), c15.ewm(span=50, adjust=False).mean()
+    p15 = float(c15.iloc[-1])
+    hi, lo = float(h.iloc[-21:-1].max()), float(l_.iloc[-21:-1].min())
+    if p15 > t50.iloc[-1] and t20.iloc[-1] > t50.iloc[-1] and price <= hi and (hi - price) / atr <= 0.6:
+        return {"side": "UP", "level": hi, "dist": (hi - price) / atr, "sq": sq, "price": price, "oi": oi_pct}
+    if p15 < t50.iloc[-1] and t20.iloc[-1] < t50.iloc[-1] and price >= lo and (price - lo) / atr <= 0.6:
+        return {"side": "DOWN", "level": lo, "dist": (price - lo) / atr, "sq": sq, "price": price, "oi": oi_pct}
+    return None
 
 
 def engine_scan(live, pinned, n, rr):
@@ -646,11 +689,18 @@ def engine_scan(live, pinned, n, rr):
                   key=lambda x: x[1]["turnover"], reverse=True)
     syms = list(dict.fromkeys([p for p in pinned] + [s for s, _ in pool[:n]]))
 
+    watch = []
+
     def work(sym):
         try:
             d5, d15 = candles(sym, "5m", 150), candles(sym, "15m", 120)
             v = live.get(sym, {})
-            r = score_coin(d5, d15, v.get("oi_pct", 0.0), 0.0, v.get("funding", 0.0), crowd_thr, rr)
+            r = score_coin(d5, d15, v.get("oi_pct", 0.0), 0.0, v.get("funding", 0.0), crowd_thr, rr,
+                           min_atr_pct=0.12, min_sl_pct=eng_min_sl, adx_min=float(eng_adx))
+            w = coil_watch(d5, d15, v.get("oi_pct", 0.0))
+            if w:
+                w["sym"] = sym
+                watch.append(w)
             if r:
                 # 6h price change (72 x 5m) OI sandarbhasathi
                 r["p6h"] = pct(float(d5.close.iloc[-1]), float(d5.close.iloc[-73])) if len(d5) > 73 else 0.0
@@ -665,13 +715,18 @@ def engine_scan(live, pinned, n, rr):
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = [r for r in ex.map(work, syms) if r]
     res.sort(key=lambda x: x["score"], reverse=True)
-    return res, len(syms)
+    watch.sort(key=lambda x: x["dist"])
+    return res, watch, len(syms)
 
 
-def eng_plan(r, capital, risk_pct):
+def eng_plan(r, capital, risk_pct, max_lev=5.0):
     risk_usd = capital * risk_pct / 100
     notional = risk_usd / (r["dist"] / r["price"])
-    return {"risk_usd": risk_usd, "notional": notional, "lev": notional / capital if capital > 0 else 0,
+    capped = notional > capital * max_lev
+    if capped:                                   # leverage mayadet: size kami, tota pan kami
+        notional = capital * max_lev
+        risk_usd = notional * r["dist"] / r["price"]
+    return {"capped": capped, "risk_usd": risk_usd, "notional": notional, "lev": notional / capital if capital > 0 else 0,
             "sl_pct": r["dist"] / r["price"] * 100}
 
 
@@ -1033,7 +1088,7 @@ def scan_view():
 
         egates = {}
         with st.spinner("इंजिन: coins चे 5m + 15m candles तपासत आहे..."):
-            eng, n_eng = engine_scan(live, [p[0] for p in pinned], eng_n, eng_rr)
+            eng, watch_l, n_eng = engine_scan(live, [p[0] for p in pinned], eng_n, eng_rr)
         best = eng[0] if eng else None
         if best and best["score"] >= eng_min:
             tk_ = taker_flow(best["sym"])
@@ -1058,7 +1113,7 @@ def scan_view():
         st.caption(f"{n_eng} coins तपासले (5m + 15m, फक्त closed candles). ENTRY = सर्वोच्च Score आणि ≥ {eng_min}.")
         if entered:
             r = best
-            pl = eng_plan(r, capital, risk_pct)
+            pl = eng_plan(r, capital, risk_pct, eng_lev)
             with st.container(border=True):
                 st.success(f'✅ ENTRY: {"🟢 LONG" if r["side"] == "UP" else "🔴 SHORT"} — **{r["sym"]}** · Score {r["score"]:.0f}/100 · {r["setup"]}')
                 m1, m2, m3, m4, m5 = st.columns(5)
@@ -1067,7 +1122,9 @@ def scan_view():
                 m3.metric("T1 (1R)", f'{r["t1"]:.6g}')
                 m4.metric(f"Target ({eng_rr}R)", f'{r["tp"]:.6g}')
                 m5.metric("Size (notional)", f'${pl["notional"]:,.0f}', f'{pl["lev"]:.1f}x lev')
-                st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}** ({risk_pct}% capital). T1 ला अर्धा नफा बुक करा, SL entry वर आणा.')
+                if pl["capped"]:
+                    st.info(f'Leverage मर्यादा {eng_lev}x मुळे size कमी केला; म्हणून तोटा {risk_pct}% पेक्षा कमी आहे.')
+                st.write(f'SL लागल्यास तोटा ≈ **${pl["risk_usd"]:.2f}**. T1 ला अर्धा नफा बुक करा, SL entry वर आणा.')
                 st.write(f'15m trend {r["htf"]}/25 · Trigger {r["trig"]}/25 · Momentum {r["mom"]}/20 · '
                          f'Volume {r["vr"]:.2f}x · ADX {r["adx"]:.0f} · RSI {r["rsi"]:.0f} · Extension {r["ext"]:.2f} ATR · '
                          f'Taker: {r.get("taker", "—")}')
@@ -1084,6 +1141,17 @@ def scan_view():
                 hide_index=True, use_container_width=True)
         else:
             st.info("आत्ता कुठल्याच coin ला trend + trigger दोन्ही नाही.")
+        st.subheader("👀 तयारी — move आधी (breakout अजून झाला नाही)")
+        if watch_l:
+            st.dataframe(pd.DataFrame([{
+                "Coin": w["sym"], "बाजू (15m trend)": "🟢 वर" if w["side"] == "UP" else "🔴 खाली",
+                "Breakout लेव्हल": w["level"], "आत्ताची किंमत": w["price"], "अंतर (ATR)": round(w["dist"], 2),
+                "शांती (ATR ratio)": round(w["sq"], 2), "OI 6h %": round(w["oi"], 2)} for w in watch_l[:8]]),
+                hide_index=True, use_container_width=True)
+            st.caption("शांती (squeeze) + 15m trend + किंमत रेंजच्या कडेला. ही फक्त तयारी आहे, move येईलच असे नाही. "
+                       "5m candle लेव्हल ओलांडून बंद झाली आणि वरचा Score ≥ किमान झाला तरच ENTRY.")
+        else:
+            st.caption("आत्ता कुठलाच coin शांतपणे breakout लेव्हलच्या जवळ नाही.")
 
         if not df.empty:
             final = df[df.FINAL.isin(["UP", "DOWN"])].sort_values(["Confirms", "Momentum Score"],
