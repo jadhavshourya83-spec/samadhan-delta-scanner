@@ -63,7 +63,7 @@ with st.sidebar:
     eng_min = st.slider("ENTRY साठी किमान Score (0-100)", 50, 90, 68, 2,
                         help="कमी = जास्त entries पण कमी दर्जा. जास्त = कमी पण कडक.")
     eng_adx = st.slider("इंजिन: किमान ADX (trend ताकद)", 12, 30, 18, 1)
-    eng_min_sl = st.slider("किमान SL अंतर % (त्याखाली SL नको)", 0.2, 1.5, 0.4, 0.1,
+    eng_min_sl = st.slider("किमान SL अंतर % (त्याखाली SL नको)", 0.3, 2.0, 0.6, 0.1,
                            help="खूप जवळचा SL spread/noise मध्येच लागतो आणि size अवाढव्य होतो.")
     eng_lev = st.slider("कमाल leverage (size मर्यादा)", 1.0, 20.0, 5.0, 1.0)
     eng_rr = st.slider("Target = किती R (SL च्या पटीत)", 1.5, 4.0, 2.0, 0.5)
@@ -579,7 +579,7 @@ def rsi_series(c, n=14):
 
 
 def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0,
-               min_atr_pct=0.12, min_sl_pct=0.4, adx_min=18.0):
+               min_atr_pct=0.12, min_sl_pct=0.6, adx_min=18.0, fee_rt=0.12):
     """d5/d15: closed-candle DataFrames. Return best side dict kinva None."""
     if len(d5) < 60 or len(d15) < 55:
         return None
@@ -630,7 +630,7 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
             touch = any((l_.iloc[-k] <= e20.iloc[-k] * 1.001) if up else (h.iloc[-k] >= e20.iloc[-k] * 0.999)
                         for k in (2, 3, 4))
             back = (price > e20.iloc[-1] and c.iloc[-1] > c.iloc[-2]) if up else (price < e20.iloc[-1] and c.iloc[-1] < c.iloc[-2])
-            if trend_ok and touch and back:
+            if trend_ok and touch and back and vr >= 1.0:        # pullback var volume sath havi
                 trig, setup = 22, "EMA20 pullback + bounce"
         if not trig:
             continue
@@ -650,8 +650,11 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
         score = min(100.0, htf + trig + mom + volp + extp + ctx + sqz)
         # SL: swing (gelya 10 candle) +/- 0.2 ATR, kamit 1 ATR, jastit jast 2.5 ATR
         sw = float(l_.iloc[-10:].min()) - 0.2 * atr if up else float(h.iloc[-10:].max()) + 0.2 * atr
-        dist = min(max(abs(price - sw), 1.0 * atr), 2.5 * atr)
-        dist = max(dist, price * min_sl_pct / 100)              # SL kamit min_sl_pct % (spread/noise madhe udu naye)
+        dist = min(max(abs(price - sw), 1.5 * atr), 3.0 * atr)   # SL kamit 1.5 ATR (5m noise madhe lagu naye)
+        dist = max(dist, price * min_sl_pct / 100)
+        sl_p = dist / price * 100
+        if (rr * sl_p - fee_rt) / (sl_p + fee_rt) < 1.4:        # fee (entry+exit) dharun kharа RR 1.4 peksha kami = nako
+            continue              # SL kamit min_sl_pct % (spread/noise madhe udu naye)
         if dist > 4 * atr:                                      # coin itka shant ki target gathane avghad
             continue
         out.append({"side": side, "score": round(score, 1), "setup": setup, "htf": htf, "trig": trig,
@@ -1121,6 +1124,8 @@ def scan_view():
                 m2.metric("Stop-loss", f'{r["sl"]:.6g}', f'-{pl["sl_pct"]:.2f}%')
                 m3.metric("T1 (1R)", f'{r["t1"]:.6g}')
                 m4.metric(f"Target ({eng_rr}R)", f'{r["tp"]:.6g}')
+                _rw, _rk = abs(r["tp"] - r["price"]) / r["price"] * 100, pl["sl_pct"]
+                st.caption(f'Target अंतर {_rw:.2f}% · SL अंतर {_rk:.2f}% · फी (येणे+जाणे ≈0.12%) धरून खरा RR 1:{(_rw - 0.12) / (_rk + 0.12):.2f}')
                 m5.metric("Size (notional)", f'${pl["notional"]:,.0f}', f'{pl["lev"]:.1f}x lev')
                 if pl["capped"]:
                     st.info(f'Leverage मर्यादा {eng_lev}x मुळे size कमी केला; म्हणून तोटा {risk_pct}% पेक्षा कमी आहे.')
