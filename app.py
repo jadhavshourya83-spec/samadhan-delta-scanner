@@ -70,7 +70,7 @@ with st.sidebar:
     e_conf = st.slider("(जुना gate) ENTRY साठी किमान पुष्टी (5 पैकी)", 2, 5, 4, 1)
     e_vol = st.slider("किमान Volume x (median च्या)", 1.0, 3.0, 1.5, 0.1)
     e_adx = st.slider("ENTRY साठी किमान ADX", 15, 35, 22, 1)
-    e_ext = st.slider("कमाल extension (ATR) - पाठलाग नको", 0.5, 3.0, 1.5, 0.25)
+    e_ext = st.slider("कमाल extension (ATR) - EMA20 पासून; पाठलाग नको", 0.5, 3.0, 1.25, 0.25)
     req_htf = st.checkbox("15m trend जुळला पाहिजे (EMA20/50)", True)
     req_taker = st.checkbox("Taker flow दिशेशी जुळला पाहिजे", True)
     st.subheader("Saved signals (paper-trade)")
@@ -579,7 +579,7 @@ def rsi_series(c, n=14):
 
 
 def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0,
-               min_atr_pct=0.12, min_sl_pct=0.6, adx_min=18.0, fee_rt=0.12):
+               min_atr_pct=0.12, min_sl_pct=0.6, adx_min=18.0, fee_rt=0.12, ext_max=1.5):
     """d5/d15: closed-candle DataFrames. Return best side dict kinva None."""
     if len(d5) < 60 or len(d15) < 55:
         return None
@@ -611,19 +611,19 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
             htf = 25 if (p15 > t50.iloc[-1] and t20.iloc[-1] > t50.iloc[-1]) else (12 if p15 > t50.iloc[-1] else None)
         else:
             htf = 25 if (p15 < t50.iloc[-1] and t20.iloc[-1] < t50.iloc[-1]) else (12 if p15 < t50.iloc[-1] else None)
-        if htf is None or ext > 3.0 or float(adx.iloc[-1]) < adx_min:
+        if htf is None or ext > ext_max or float(adx.iloc[-1]) < adx_min:
             continue
         # trigger
         trig, setup = 0, ""
-        for k in (1, 2, 3):                                   # gelya 3 closed candle madhe breakout
+        for k in (1, 2):                                      # fakt gelya 2 closed candle madhe breakout (3rd = late)
             i = len(c) - k
             lvl = float(h.iloc[i - 20:i].max()) if up else float(l_.iloc[i - 20:i].min())
             if (up and c.iloc[i] > lvl) or (not up and c.iloc[i] < lvl):
                 late = ((price - lvl) if up else (lvl - price)) / atr
-                if late > 1.5:                                 # breakout pasun 1.5 ATR pudhe = late, nako
+                if late > 0.8:                                 # breakout pasun 0.8 ATR pudhe = late, nako
                     continue
                 if (up and price > lvl) or (not up and price < lvl):   # ajun tikla ahe
-                    trig, setup = {1: 25, 2: 20, 3: 12}[k], f"20-candle breakout ({k} candle purvi)"
+                    trig, setup = {1: 25, 2: 20}[k], f"20-candle breakout ({k} candle purvi)"
                     break
         if not trig:                                           # pullback bounce EMA20 var
             trend_ok = (e20.iloc[-1] > e50.iloc[-1]) if up else (e20.iloc[-1] < e50.iloc[-1])
@@ -634,11 +634,14 @@ def score_coin(d5, d15, oi_pct=0.0, price6h=0.0, funding=0.0, crowd=0.03, rr=2.0
                 trig, setup = 22, "EMA20 pullback + bounce"
         if not trig:
             continue
+        ran = ((price - float(c.iloc[-13])) if up else (float(c.iloc[-13]) - price)) / atr
+        if ran > 3.5:                                          # gelya 1 tasat dishene 3.5 ATR chalala = move zalach
+            continue
         mom = (8 if ((pdi.iloc[-1] > mdi.iloc[-1]) if up else (pdi.iloc[-1] < mdi.iloc[-1])) else 0) \
             + (6 if adx.iloc[-1] >= 18 else 0) + (3 if adx.iloc[-1] > adx.iloc[-4] else 0) \
             + (3 if ((50 <= rsi.iloc[-1] <= 72) if up else (28 <= rsi.iloc[-1] <= 50)) else 0)
         volp = 15 * min(1.0, max(0.0, (vr - 0.8) / 1.0))
-        extp = 10 * max(0.0, 1 - ext / 3.0)
+        extp = 10 * max(0.0, 1 - ext / ext_max)
         ctx = 0
         if (up and oi_pct > 0.5 and price6h > 0) or (not up and oi_pct > 0.5 and price6h < 0):
             ctx += 5
@@ -699,7 +702,7 @@ def engine_scan(live, pinned, n, rr):
             d5, d15 = candles(sym, "5m", 150), candles(sym, "15m", 120)
             v = live.get(sym, {})
             r = score_coin(d5, d15, v.get("oi_pct", 0.0), 0.0, v.get("funding", 0.0), crowd_thr, rr,
-                           min_atr_pct=0.12, min_sl_pct=eng_min_sl, adx_min=float(eng_adx))
+                           min_atr_pct=0.12, min_sl_pct=eng_min_sl, adx_min=float(eng_adx), ext_max=float(e_ext))
             w = coil_watch(d5, d15, v.get("oi_pct", 0.0))
             if w:
                 w["sym"] = sym
