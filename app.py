@@ -814,6 +814,99 @@ def eng_plan(r, capital, risk_pct, max_lev=5.0):
             "sl_pct": r["dist"] / r["price"] * 100}
 
 
+# ───────────────────────── 🐋 MOTHA KHELADI (FOOTPRINT) SCORE ─────────────────────────
+# Ha 'operator' olakhat nahi; fakt pavlakhuna: motthe vyavahar, OI chi udi, absorption, orderbook asantulan, volume spike.
+def _norm_ts(t):
+    if t > 1e17:
+        return t / 1e9
+    if t > 1e14:
+        return t / 1e6
+    if t > 1e11:
+        return t / 1e3
+    return t
+
+
+def big_trades(sym, window_min=15, mult=10.0):
+    """Public trades madhun: median peksha mult-pat motthe vyavahar kiti, ani tyatil aggressor khareedi/vikri."""
+    try:
+        rows = get(f"/v2/trades/{sym}")
+        if isinstance(rows, dict):
+            rows = rows.get("trades") or rows.get("result") or []
+    except Exception as ex_:
+        return {"ok": False, "why": str(ex_)[:80]}
+    if not isinstance(rows, list):
+        return {"ok": False, "why": "vegla format"}
+    now, items = time.time(), []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        size = f(r, "size", "quantity", "volume")
+        if size <= 0:
+            continue
+        t = _norm_ts(f(r, "timestamp", default=0.0))
+        if t and now - t > window_min * 60:
+            continue
+        br, sr, sd = str(r.get("buyer_role", "")).lower(), str(r.get("seller_role", "")).lower(), str(r.get("side", "")).lower()
+        side = "buy" if (br == "taker" or (br != "taker" and sr != "taker" and sd == "buy")) else \
+               ("sell" if (sr == "taker" or sd == "sell") else None)
+        items.append((size, side))
+    if len(items) < 20:
+        return {"ok": False, "why": f"फक्त {len(items)} व्यवहार"}
+    med = float(np.median([x[0] for x in items]))
+    large = [x for x in items if med > 0 and x[0] >= mult * med]
+    return {"ok": True, "n": len(large), "lb": sum(z for z, sd in large if sd == "buy"),
+            "ls": sum(z for z, sd in large if sd == "sell"), "med": med, "total": len(items)}
+
+
+def book_ratio(sym, depth=10):
+    """Orderbook: top-depth bid volume / ask volume. Format na sapadla tar None."""
+    try:
+        j = get(f"/v2/l2orderbook/{sym}", {"depth": depth})
+        if not isinstance(j, dict):
+            return None
+        bids, asks = j.get("buy") or j.get("bids") or [], j.get("sell") or j.get("asks") or []
+        sb = sum(f(x, "size", "quantity") for x in bids[:depth] if isinstance(x, dict))
+        sa = sum(f(x, "size", "quantity") for x in asks[:depth] if isinstance(x, dict))
+        return sb / sa if sb > 0 and sa > 0 else None
+    except Exception:
+        return None
+
+
+def footprint_score(side, big, oi_gain, share, price_chg, ratio, vr, pflat_=0.5):
+    """Return (agree 0-100, oppose 0-100, notes). Fakt trade chya dishela jamnare gun 'agree' madhe; ulat gun 'oppose' madhe.
+       motthe vyavahar 30 | OI udi 25 | absorption 20 | orderbook 15 | volume spike 10 (OI ani volume dishahin = fakt halchal)."""
+    up = side == "UP"
+    agree = opp = 0.0
+    notes = []
+    if big and big.get("ok") and big["n"] >= 1 and (big["lb"] + big["ls"]) > 0:
+        frac = (big["lb"] - big["ls"]) / (big["lb"] + big["ls"])
+        pts = 30 * min(1.0, big["n"] / 3) * min(1.0, abs(frac))
+        if (frac > 0) == up and abs(frac) > 0.05:
+            agree += pts; notes.append(f'मोठे व्यवहार {big["n"]} (दिशेला, {abs(frac) * 100:.0f}%)')
+        elif abs(frac) > 0.05:
+            opp += pts; notes.append(f'मोठे व्यवहार {big["n"]} (उलट दिशेला)')
+    elif big and big.get("ok"):
+        notes.append("मोठे व्यवहार नाहीत")
+    if oi_gain is not None and oi_gain > 0:
+        agree += 25 * min(1.0, oi_gain / 1.5); notes.append(f"OI +{oi_gain:.2f}% (ताजा)")
+    if share is not None and price_chg is not None and abs(price_chg) <= pflat_ and abs(share - 0.5) >= 0.1:
+        pts = 20 * min(1.0, abs(share - 0.5) / 0.25)
+        absorb_up = share <= 0.5                     # vikri ghayeechi pan kimat tikli = shant khareedi
+        if absorb_up == up:
+            agree += pts; notes.append("शांत शोषण (दिशेला)")
+        else:
+            opp += pts; notes.append("शांत शोषण (उलट)")
+    if ratio is not None and (ratio >= 1.5 or ratio <= 0.67):
+        pts = 15 * min(1.0, ((ratio - 1) if ratio >= 1.5 else (1 / ratio - 1)) / 1.5)
+        if (ratio >= 1.5) == up:
+            agree += pts; notes.append(f"Orderbook असंतुलन {ratio:.1f}x (दिशेला)")
+        else:
+            opp += pts; notes.append(f"Orderbook असंतुलन {ratio:.1f}x (उलट)")
+    if vr and vr >= 1.5:
+        agree += 10 * min(1.0, (vr - 1) / 2); notes.append(f"Volume {vr:.1f}x")
+    return round(min(100.0, agree)), round(min(100.0, opp)), notes
+
+
 # ───────────────────────── OI HISTORY + OPERATOR FOOTPRINTS ─────────────────────────
 # Prati scan prati coin cha (vel, price, OI value, funding) lakshat theto (session madhe, max 3 tas).
 # OI "contracts" = oi_value_usd / price  -> price badalla tari OI chi khari vadh dakhavto.
@@ -1228,6 +1321,20 @@ def scan_view():
                 st.write(f'15m trend {r["htf"]}/25 · Coil {r["trig"]}/20 · Momentum {r["mom"]}/20 · OI {r["oi"]}/20 · '
                          f'Volume {r["vr"]:.2f}x · ADX {r["adx"]:.0f} · RSI {r["rsi"]:.0f} · Extension {r["ext"]:.2f} ATR · '
                          f'Taker: {r.get("taker", "—")}')
+                _bg = big_trades(r["sym"])
+                _bk = book_ratio(r["sym"])
+                _fp = footprint(r["sym"], 10)
+                _ag, _op, _nt = footprint_score(r["side"], _bg, _fp["oi_gain"] if _fp else None,
+                                                tk_["buy_share"] if tk_["ok"] else None,
+                                                _fp["price_chg"] if _fp else None, _bk, r["vr"], pflat)
+                _lbl = "🟢 जास्त" if _ag >= 50 and _ag > _op else ("🟡 थोडी" if _ag >= 25 else "⚪ कमी")
+                st.write(f'🐋 **मोठा खेळाडू (पाऊलखुणा) शक्यता: {_lbl}** · दिशेला {_ag}/100 · उलट {_op}/100'
+                         + (" — " + "; ".join(_nt) if _nt else ""))
+                if _op >= 25 and _op >= _ag:
+                    st.warning("⚠ मोठ्या खेळाडूच्या खुणा उलट दिशेला जास्त दिसतात. सावध रहा किंवा थांबा.")
+                if not (_bg and _bg.get("ok")):
+                    st.caption("मोठ्या व्यवहारांचा डेटा मिळाला नाही: " + str((_bg or {}).get("why", "?")) + ". Orderbook "
+                               + ("मिळाला." if _bk else "मिळाला नाही.") + " OI इतिहास फक्त ॲप काही मिनिटे उघडे असेल तरच जमतो.")
                 st.write(f'👥 **भीड (funding {r.get("funding", 0):+.3f}):** {r.get("crowd", "—")}')
                 st.caption("Perpetual मध्ये long आणि short OI नेहमी बरोबर असतात, बाजूनुसार वाटणी public नाही. म्हणून भीड = funding चिन्ह (अंदाज), खात्रीची आकडेवारी नाही.")
                 if pl["lev"] > 10:
