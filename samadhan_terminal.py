@@ -54,6 +54,9 @@ class Cfg:
     flow_steps: int = 6
     flow_confirm_min: float = 2.0
     flow_min_ltp: float = 5.0
+    flow_oi_jump_max: float = 40.0     # 5 min madhe OI itka % jast badalla (kinva ek snapshot madhe 2x/0.5x) tar data sanshayaspad -> sanket baad
+    flow_spot_conflict_pct: float = 0.10   # spot itka % ulat dishene halla ahe tar sanket baad (UP sanket + spot khali, kinva ulat)
+    flow_block_conflict: bool = True
     # CAS v2 ("aadhi-oLakh" radar): OI jama hot ahe + premium dabat ahe + spot ajun halla nahi
     cas_long_min: float = 10.0       # mothi window (minute)
     cas_short_min: float = 3.0       # lahan window: veg vadhla ka
@@ -555,8 +558,25 @@ def flow_score(side, strike, spot, oi_pct, prem_pct, vol_ratio, iv_chg, prem_raw
             "reasons": r_up if direction == "UP" else r_dn}
 
 
+def oi_suspect(h, window_min, max_pct, oi_pct):
+    """OI cha data sanshayaspad ahe ka: window madhe jast %, kinva don snapshot madhe 2x/0.5x udi (data update/reset chi shakyata)."""
+    if abs(oi_pct) > max_pct:
+        return True
+    if not h:
+        return False
+    t_now = h[-1][0]
+    recent = [x for x in h if x[0] >= t_now - window_min * 60 - 60]
+    for a, b in zip(recent, recent[1:]):
+        if a[2] > 0 and b[2] > 0:
+            r = b[2] / a[2]
+            if r >= 2.0 or r <= 0.5:
+                return True
+    return False
+
+
 def flow_rank(store, sym, expiry, oc, spot, cfg, step):
-    out = []
+    out, dropped = [], []
+    mv = spot_move_pct(store, cfg.flow_window_min, sym)
     for strike, node in strike_map(oc).items():
         if abs(strike - spot) > cfg.flow_steps * step:
             continue
@@ -565,14 +585,22 @@ def flow_rank(store, sym, expiry, oc, spot, cfg, step):
             ltp, oi = _f(o.get("last_price")), _f(o.get("oi"))
             if ltp < cfg.flow_min_ltp or oi < cfg.min_oi:        # ashakya/pathal strikes baad
                 continue
-            m = flow_metrics(store.get(flow_key(sym, expiry, strike, side)), cfg.flow_window_min,
-                             spot_hist=store.get(f"__spot__{sym}"))
+            hist = store.get(flow_key(sym, expiry, strike, side))
+            m = flow_metrics(hist, cfg.flow_window_min, spot_hist=store.get(f"__spot__{sym}"))
             if not m:
+                continue
+            if oi_suspect(hist, cfg.flow_window_min, cfg.flow_oi_jump_max, m["oi_pct"]):
+                dropped.append(f"{strike:.0f} {side.upper()}: OI डेटा संशयास्पद (OI {m['oi_pct']:+.0f}%); संकेत बाजूला")
                 continue
             sc = flow_score(side.upper(), strike, spot, m["oi_pct"], m["prem_pct"], m["vol_ratio"], m["iv_chg"],
                             prem_raw=m.get("prem_raw"), adj=m.get("adj", False))
             if sc["score"] >= cfg.flow_min_score:
+                if (cfg.flow_block_conflict and mv is not None and abs(mv) >= cfg.flow_spot_conflict_pct
+                        and ((sc["direction"] == "UP" and mv < 0) or (sc["direction"] == "DOWN" and mv > 0))):
+                    dropped.append(f"{strike:.0f} {side.upper()}: संकेत {sc['direction']} पण spot {mv:+.2f}% उलट दिशेने; बाजूला")
+                    continue
                 out.append({"strike": strike, "side": side, "ltp": ltp, "oi": oi, **m, **sc})
+    store["__flow_dropped__"] = dropped
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -924,6 +952,9 @@ def main():
             meta["step"] = float(st.number_input("Strike अंतर", 0.05, 100000.0, float(okf.get("step") or 50.0), 0.05,
                                                  key=f"cm_step_{sym}_{okf.get('step')}"))
             meta["lot"] = int(okf.get("lot") or 1)
+            meta["tol"] = float(st.number_input("Chain spot आणि चार्ट भावातला फरक किती चालेल (%)", 0.5, 15.0, 4.0, 0.5,
+                                                help="MCX option चा underlying एका विशिष्ट महिन्याचा future असतो, चार्ट बहुधा जवळच्या महिन्याचा. "
+                                                     "NATURALGAS मध्ये दोन महिन्यांच्या भावात 2-5% फरक सामान्य आहे."))
         st.subheader("💰 भांडवल व जोखीम")
         capital = st.number_input("भांडवल (₹)", 10000, 100000000, 100000, 10000)
         risk_pct = st.slider("एका ट्रेडमध्ये जोखीम %", 0.25, 3.0, 1.0, 0.25)
@@ -1086,9 +1117,11 @@ def main():
             return
         df, note = drop_forming_candle(raw, tf_min, now)
         sig = evaluate_signal(df, cfg)
-        if sig["close"] and spot and abs(spot / sig["close"] - 1) > 0.015:
-            st.error(f"⚠ Chain चा spot ({spot:,.0f}) आणि चार्टचा भाव ({sig['close']:,.0f}) जुळत नाहीत. "
-                     f"Security id ({meta['id']}) {sym} चा आहे का तपासा. निर्णय थांबवला.")
+        if sig["close"] and spot and abs(spot / sig["close"] - 1) > meta.get("tol", 1.5) / 100:
+            st.error(f"⚠ Chain चा spot ({spot:,.0f}) आणि चार्टचा भाव ({sig['close']:,.0f}) जुळत नाहीत "
+                     f"(फरक {abs(spot / sig['close'] - 1) * 100:.1f}%, परवानगी {meta.get('tol', 1.5):.1f}%). "
+                     f"Security id ({meta['id']}) {sym} चा आहे का तपासा. कमोडिटी असेल तर option चा future महिना आणि चार्टचा महिना वेगळा असू शकतो; "
+                     f"sidebar मध्ये फरकाची मर्यादा वाढवा. निर्णय थांबवला.")
             return
 
         # 4) Nirnay
@@ -1180,6 +1213,11 @@ def main():
             st.caption(f"spot ची हालचाल (शेवटच्या {cfg.flow_window_min:.0f} मि): "
                        + (f"{mv:+.2f}% (~{mv / 100 * spot:+.0f} पॉइंट)" if mv is not None else "इतिहास जमतोय")
                        + " · Premium 'spot वगळून' = कच्चा premium − (delta × spot बदल). दोन्ही सारखे असतील तर spot ने फारसा हललाच नाही.")
+            _dr = st.session_state["flow_store"].get("__flow_dropped__") or []
+            if _dr:
+                with st.expander(f"🛡 बाजूला ठेवलेले संकेत ({len(_dr)}): डेटा संशयास्पद किंवा spot उलट दिशेने"):
+                    for _x in _dr[:15]:
+                        st.write("• " + _x)
             st.dataframe(pd.DataFrame([{
                 "Strike": f"{x['strike']:.0f} {x['side'].upper()}", "दिशा": x["direction"], "Score": x["score"],
                 "संकेत (घ्यायचा option)": ("PE" if x["direction"] == "DOWN" else "CE") + f" बाजूला, ATM {atm:.0f} जवळ",
@@ -1207,6 +1245,11 @@ def main():
                 st.warning(f"OI flow दिशा {flow_best['direction']}, पण option बाद: " + " | ".join(fo["issues"]))
         else:
             st.info(f"OI flow candidate नाही ({n_hist} option चा इतिहास जमा; किमान ~3-5 मिनिटांचा डेटा लागतो).")
+            _dr = st.session_state["flow_store"].get("__flow_dropped__") or []
+            if _dr:
+                with st.expander(f"🛡 बाजूला ठेवलेले संकेत ({len(_dr)}): डेटा संशयास्पद किंवा spot उलट दिशेने"):
+                    for _x in _dr[:15]:
+                        st.write("• " + _x)
 
         st.subheader("🟡 CAS: writers चा radar, move च्या आधी (फक्त माहिती)")
         cas_list = cas_detect(st.session_state["flow_store"], sym, expiry, oc, spot, cfg, meta["step"])
