@@ -284,6 +284,23 @@ def strike_map(oc):
     return out
 
 
+def implied_spot(oc, min_px=0.3):
+    """Put-call parity: K + CE - PE = option cha khara underlying. MCX madhe chain cha 'last_price' dusrya mahinyacha future asu shakto
+    (expiry diwashi 4% paryant farak), pan option bhav tya expiry chya futurevar astat. ATM/delta/strike nivd yavarun hava.
+    ATM javalchya 3 strike cha median (CE ani PE donhi >= min_px). Kami data = None."""
+    est = []
+    for k, node in strike_map(oc).items():
+        ce = _f(((node or {}).get("ce") or {}).get("last_price"))
+        pe = _f(((node or {}).get("pe") or {}).get("last_price"))
+        if ce >= min_px and pe >= min_px:
+            est.append((abs(ce - pe), k + ce - pe))
+    if len(est) < 3:
+        return None
+    est.sort()
+    top = sorted(v for _, v in est[:3])
+    return top[1]
+
+
 def chain_ltp(oc, strike, side):
     node = ((strike_map(oc).get(float(strike)) or {}).get(side) or {})
     v = _f(node.get("last_price"))
@@ -621,6 +638,66 @@ def flow_relation(flow_dir, direction):
     return "agree" if flow_dir == direction else "oppose"
 
 
+# ───────── SIGNAL TRACKER: kon-ta engine kiti vela barobar? (spot chya dishene, 60 min madhe) ─────────
+SIG_X = 0.15          # % : sanketachya dishene itka halla = HIT, ulat itka halla = MISS
+SIG_HORIZON_MIN = 60  # itkya velat kahich nahi = NO MOVE
+
+
+def siglog_add(log, now_ts, sym, expiry, engine, direction, strike, side, spot, score, exp_day, dedupe_min=15):
+    """Navin sanket nondva. Tyach engine/dishecha sanket 15 min madhe punha ala tar nondvat nahi."""
+    if direction not in ("UP", "DOWN") or not spot:
+        return False
+    for r in reversed(log):
+        if r["sym"] == sym and r["engine"] == engine and r["dir"] == direction and now_ts - r["t"] < dedupe_min * 60:
+            return False
+    log.append({"t": now_ts, "sym": sym, "expiry": expiry, "engine": engine, "dir": direction, "strike": strike,
+                "side": side, "spot0": float(spot), "score": score, "exp_day": bool(exp_day), "status": "OPEN",
+                "fav": 0.0, "adv": 0.0, "result": None, "t_res": None})
+    return True
+
+
+def siglog_update(log, now_ts, sym, spot, x=SIG_X, horizon_min=SIG_HORIZON_MIN):
+    """Ughdya sanketanchi ajchi spot disha tapasa. HIT/MISS/NO MOVE. App band hota ani data tutla tar 'NO DATA'."""
+    if not spot:
+        return
+    for r in log:
+        if r["status"] != "OPEN" or r["sym"] != sym:
+            continue
+        age = now_ts - r["t"]
+        if age > horizon_min * 60 * 1.5:          # refresh madhe khup antar = mojta yet nahi
+            r["status"], r["result"], r["t_res"] = "DONE", "NO DATA", now_ts
+            continue
+        mv = (spot / r["spot0"] - 1) * 100 * (1 if r["dir"] == "UP" else -1)
+        r["fav"], r["adv"] = max(r["fav"], mv), min(r["adv"], mv)
+        if mv >= x:
+            res = "HIT"
+        elif mv <= -x:
+            res = "MISS"
+        elif age >= horizon_min * 60:
+            res = "NO MOVE"
+        else:
+            continue
+        r["status"], r["result"], r["t_res"] = "DONE", res, now_ts
+
+
+def siglog_summary(log):
+    """Engine x (expiry diwas / itar diwas) pramane HIT/MISS/NO MOVE. Pharak 'NO DATA' mojat nahi."""
+    rows = {}
+    for r in log:
+        if r["status"] != "DONE" or r["result"] == "NO DATA":
+            continue
+        k = (r["engine"], "expiry diwas" if r["exp_day"] else "itar diwas")
+        d = rows.setdefault(k, {"n": 0, "HIT": 0, "MISS": 0, "NO MOVE": 0})
+        d["n"] += 1
+        d[r["result"]] += 1
+    out = []
+    for (eng, day), d in sorted(rows.items()):
+        dec = d["HIT"] + d["MISS"]
+        out.append({"engine": eng, "diwas": day, "sanket": d["n"], "HIT": d["HIT"], "MISS": d["MISS"], "NO MOVE": d["NO MOVE"],
+                    "HIT % (HIT+MISS madhe)": None if dec == 0 else round(100 * d["HIT"] / dec, 1)})
+    return out
+
+
 # ───────── CAS v2: 'move chya aadhi' writers cha radar + sarvottam hedge ─────────
 def spot_move_pct(store, window_min, sym=""):
     """Spot ne shevtchya window madhe kiti % halla (+ var / - khali). Itihas kami asel tar None."""
@@ -794,6 +871,24 @@ def consensus(votes, min_agree=2):
     return "WAIT", up if len(up) >= len(dn) else dn, dn if len(up) >= len(dn) else up
 
 
+def v34_winner(g):
+    """V34 snippet (v34_engine.py) chya exec nantarche globals madhun 'ABSOLUTE CONFIRMED WINNER' kadha.
+    Snippet chich ata: hero_list, rank >= 65, equilibrium/choppy nasel tar. Disha: CALL=UP, PUT=DOWN."""
+    hero = g.get("hero_list") or []
+    if not hero or g.get("is_equilibrium_active") or g.get("market_mode") == "🔴 CHOPPY / RANGEBOUND":
+        return None
+    lead = sorted(hero, key=lambda x: x["rank_score"], reverse=True)[0]
+    if lead["rank_score"] < 65:
+        return None
+    try:
+        strike = float(str(lead["option"]).split()[1])
+    except Exception:
+        strike = None
+    return {"dir": "UP" if lead["type"] == "CALL" else "DOWN", "strike": strike, "side": "ce" if lead["type"] == "CALL" else "pe",
+            "score": lead["rank_score"], "option": lead["option"], "stage": lead.get("stage", ""),
+            "alloc": lead.get("allocation", ""), "premium": lead.get("premium"), "action": lead.get("action_text", "")}
+
+
 # ───────── MCX commodity: Dhan instrument list madhun id/lot/strike-gap shodha ─────────
 MCX_COMMON = ["CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI", "GOLD", "GOLDM", "GOLDPETAL", "SILVER", "SILVERM", "SILVERMIC",
               "COPPER", "ZINC", "ZINCMINI", "ALUMINIUM", "LEAD", "NICKEL"]
@@ -889,6 +984,7 @@ def main():
 
     IST = timezone(timedelta(hours=5, minutes=30))
     JOURNAL = Path(__file__).with_name("entry_journal.json")
+    SIGLOG = Path(__file__).with_name("signal_log.json")
 
     @st.cache_data(ttl=43200, show_spinner="Dhan instrument list उतरवत आहे (मोठी फाईल, पहिल्यांदा थोडा वेळ)...")
     def load_scrip_master():
@@ -971,6 +1067,7 @@ def main():
             cas_strong = st.slider("STRONG score किमान", 50, 95, 70, 5)
             cas_late = st.slider("spot इतका हलला तर 'LATE' %", 0.1, 1.0, 0.40, 0.05)
         run_v40_on = st.checkbox("V40.2 OI इंजिन (तुमचा कोड) चालवा", True)
+        run_v34_on = st.checkbox("V34 इंजिन (तुमचा कोड) चालवा (SENSEX / NIFTY)", False)
         tf_min = int(st.selectbox("⏱ Candle (मिनिटे)", [5, 3, 1], 0,
                                   help="लहान candle = सिग्नल लवकर पण जास्त खोटे. 3 किंवा 1 मिनिट Dhan/Tradehull ने समर्थित असावे (तपासलेले नाही). "
                                        "चुकले तर 'Candle डेटा त्रुटी' दिसेल; 5 वर परत या."))
@@ -1013,6 +1110,11 @@ def main():
             st.session_state["journal"] = json.loads(JOURNAL.read_text())
         except Exception:
             st.session_state["journal"] = []
+    if "siglog" not in st.session_state:
+        try:
+            st.session_state["siglog"] = json.loads(SIGLOG.read_text())
+        except Exception:
+            st.session_state["siglog"] = []
     st.session_state.setdefault("flow_store", {})
     st.session_state.setdefault("flow_top", [])
 
@@ -1096,6 +1198,13 @@ def main():
             st.error(f"Option chain त्रुटी: {e}")
             return
         spot, oc = chain["spot"], chain["oc"]
+        spot_note = ""
+        if meta.get("custom"):                       # commodity: chain cha spot dusrya mahinyacha future asu shakto -> option bhavatun khara spot
+            imp_ = implied_spot(oc)
+            if imp_ and spot and abs(imp_ / spot - 1) > 0.005:
+                spot_note = (f"ℹ️ Chain चा underlying {spot:,.1f} आहे, पण option भावांवरून (put-call parity) खरा underlying {imp_:,.1f} निघतो "
+                             f"(फरक {abs(imp_ / spot - 1) * 100:.1f}%). ATM आणि strike निवडीसाठी {imp_:,.1f} वापरला आहे.")
+                spot = imp_
         if st.session_state.get("flow_day") != today:               # navin divas = junya memory chi kachra nako
             st.session_state["flow_store"], st.session_state["flow_top"] = {}, []
             st.session_state["flow_day"] = today
@@ -1162,6 +1271,8 @@ def main():
         save_journal()
 
         # ───────── UI ─────────
+        if spot_note:
+            st.info(spot_note)
         st.caption(f"{now:%d-%b %H:%M:%S} IST · Spot {spot:,.1f} · {note} · ATR {sig['atr']:.1f} · "
                    f"ADX {sig['adx']:.0f} · RSI {sig['rsi']:.0f}")
         top = st.container()          # sahmati nirnay ithe (V40 nantar bharto)
@@ -1253,6 +1364,25 @@ def main():
 
         st.subheader("🟡 CAS: writers चा radar, move च्या आधी (फक्त माहिती)")
         cas_list = cas_detect(st.session_state["flow_store"], sym, expiry, oc, spot, cfg, meta["step"])
+        # Signal tracker: sagle engines che sanket nondva ani jhalelyancha nikal tapasa (fakt maahiti, order nahi)
+        SL_ = st.session_state["siglog"]
+        _exp_day = (expiry == today)
+        if sig["direction"] in ("UP", "DOWN"):
+            siglog_add(SL_, now_ts, sym, expiry, "CHART", sig["direction"], None, None, spot, None, _exp_day)
+        if enter:
+            siglog_add(SL_, now_ts, sym, expiry, "ENTER (sahmati)", direction, opt["strike"], opt["side"], spot, None, _exp_day)
+        if flow_ok and flow_best:
+            siglog_add(SL_, now_ts, sym, expiry, "OI FLOW", flow_best["direction"], flow_best["strike"], flow_best["side"], spot,
+                       flow_best.get("score"), _exp_day)
+        for c_ in cas_list:
+            if c_["stage"] in ("EARLY", "STRONG"):
+                siglog_add(SL_, now_ts, sym, expiry, "CAS " + c_["stage"], "UP" if c_["bias"] == "BULLISH" else "DOWN",
+                           c_["strike"], c_["side"], spot, c_["score"], _exp_day)
+        siglog_update(SL_, now_ts, sym, spot)
+        try:
+            SIGLOG.write_text(json.dumps(SL_))
+        except Exception:
+            pass
         if cas_list:
             icon = {"STRONG": "🔥", "EARLY": "🟡", "LATE": "⏰"}
             for c in cas_list[:3]:
@@ -1273,6 +1403,23 @@ def main():
             st.caption("Credit spread = विकणे; margin लागतो (इथे धरलेला नाही, broker वर तपासा). हा 'writers जमत असावेत' असा अंदाज आहे, move येईलच याची खात्री नाही.")
         else:
             st.caption("CAS नाही (OI वाढ + premium दबाव हवा; इतिहास जमा व्हायला किमान 2–10 मिनिटे लागतात).")
+
+        with st.expander("📊 Signal tracker: कोणता engine किती वेळा बरोबर? (spot च्या दिशेने 0.15%, 60 मिनिटांत)"):
+            summ = siglog_summary(st.session_state["siglog"])
+            n_open = sum(1 for r in st.session_state["siglog"] if r["status"] == "OPEN")
+            if summ:
+                st.dataframe(pd.DataFrame(summ), hide_index=True, use_container_width=True)
+            else:
+                st.caption("अजून निकाल नाही (सिग्नल आल्यानंतर 60 मिनिटांपर्यंत ॲप चालू ठेवा).")
+            st.caption(f"चालू (निकाल बाकी): {n_open}. HIT = सिग्नलच्या दिशेने spot +{SIG_X}% आधी गेला; MISS = उलट -{SIG_X}% आधी; "
+                       f"NO MOVE = {SIG_HORIZON_MIN} मिनिटांत दोन्ही नाही. हे फक्त spot वर आधारित आहे (option premium, theta, SL धरलेले नाही). "
+                       "Refresh च्या मधला wick चुकू शकतो. 30+ सिग्नल होईपर्यंत टक्केवारीवर विश्वास ठेवू नका. Streamlit Cloud वर फाईल रीस्टार्टवर पुसली जाते, म्हणून CSV उतरवून ठेवा.")
+            if st.session_state["siglog"]:
+                _df = pd.DataFrame(st.session_state["siglog"])
+                _df["वेळ"] = pd.to_datetime(_df["t"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%d-%b %H:%M")
+                st.dataframe(_df[["वेळ", "sym", "engine", "dir", "strike", "side", "spot0", "exp_day", "status", "result", "fav", "adv"]].iloc[::-1],
+                             hide_index=True, use_container_width=True)
+                st.download_button("⬇ CSV उतरवा", _df.drop(columns=["वेळ"]).to_csv(index=False).encode(), "signal_log.csv", "text/csv")
 
         st.subheader("📒 Journal (paper-trade): win rate")
         J = st.session_state["journal"]
@@ -1333,7 +1480,49 @@ def main():
                     else:
                         st.warning("V40 सिग्नल आहे, पण योजना बनत नाही: " + (vp["note"] or "?"))
 
-        # ───────── सहमती: चार्ट + OI flow + CAS + V40 ─────────
+        v34_win = None
+        if run_v34_on:
+            st.divider()
+            v34_file = Path(__file__).with_name("v34_engine.py")
+            if meta.get("custom"):
+                st.info("ℹ️ V34 index (SENSEX / NIFTY) साठी आहे, कमोडिटीसाठी नाही.")
+            elif not v34_file.exists():
+                st.warning("v34_engine.py सापडली नाही (samadhan_terminal.py च्या शेजारी ठेवा).")
+            else:
+                ctx34 = (sym, expiry)
+                if st.session_state.get("v34_ctx") != ctx34:            # expiry/index badalla = V34 chi memory navi
+                    for k_ in ("trend_history", "previous_direction", "premium_history", "delta_history", "stage3_counter", "leader_lock_history"):
+                        st.session_state.pop(k_, None)
+                    st.session_state["v34_ctx"] = ctx34
+                g34 = {"__name__": "v34_engine", "st": st, "oc": oc, "spot": spot, "df_5": df, "main_sym": sym}
+                with st.expander("🏆 V34 Sensex desk (तुमचा कोड, जसा आहे तसा)", expanded=True):
+                    try:
+                        exec(compile(v34_file.read_text(encoding="utf-8"), str(v34_file), "exec"), g34)
+                    except Exception as e_:
+                        st.error(f"V34 इंजिन त्रुटी: {e_}")
+                v34_win = v34_winner(g34)
+                if v34_win:
+                    _q = g34.get("market_bias")          # V34 cha 5-scan queue kal: CALL / PUT / NEUTRAL
+                    _rel = ("queue तटस्थ" if _q not in ("CALL", "PUT") else
+                            ("queue सोबत" if (_q == "CALL") == (v34_win["dir"] == "UP") else "queue उलट"))
+                    _tgk = f"v34_tg_{sym}_{v34_win['dir']}"
+                    if now_ts - st.session_state.get(_tgk, 0) > 15 * 60:        # 15 min madhe tyach dishecha duhera Telegram nako
+                        st.session_state[_tgk] = now_ts
+                        _ok = send_telegram(f"🏆 V34 WINNER · {sym} {v34_win['option']} ({'CALL ↑' if v34_win['dir'] == 'UP' else 'PUT ↓'})\n"
+                                            f"{v34_win['stage']} · rank {v34_win['score']:.0f}% · premium ₹{(v34_win['premium'] or 0):.2f} · "
+                                            f"{v34_win['alloc']} ({v34_win['action']})\n"
+                                            f"Spot {spot:,.1f} · Expiry {expiry} · {_rel} · {now:%H:%M}\n"
+                                            "फक्त माहिती; order आपोआप जात नाही. सल्ला नाही.")
+                        st.toast("V34 Telegram: " + ("पाठवला" if _ok else "पाठवला नाही (secrets तपासा)"))
+                    siglog_add(SL_, now_ts, sym, expiry, f"V34 WINNER ({_rel})", v34_win["dir"], v34_win["strike"], v34_win["side"],
+                               spot, v34_win["score"], _exp_day)
+                    siglog_update(SL_, now_ts, sym, spot)
+                    try:
+                        SIGLOG.write_text(json.dumps(SL_))
+                    except Exception:
+                        pass
+
+        # ───────── सहमती: चार्ट + OI flow + CAS + V40 (+V34) ─────────
         v40_vs = st.session_state.get("v40_last_signal") if run_v40_on else None
         v40_act = bool(v40_vs and v40_vs.get("scan") == st.session_state.get("v40_scan_count"))
         cas_strong = next((c for c in cas_list if c["stage"] == "STRONG"), None)
@@ -1341,6 +1530,9 @@ def main():
                  "OI flow": flow_dir,
                  "CAS": (None if not cas_strong else ("UP" if cas_strong["bias"] == "BULLISH" else "DOWN")),
                  "V40": (("UP" if v40_vs["type"] == "CE" else "DOWN") if v40_act else None)}
+        if run_v34_on and not meta.get("custom"):
+            votes["V34"] = v34_win["dir"] if v34_win else None
+        n_eng = len(votes)
         c_dir, c_agree, c_opp = consensus(votes, min_agree)
         with top:
             vrow = {k: {"UP": "🟢 UP", "DOWN": "🔴 DOWN", None: "—"}[v] for k, v in votes.items()}
@@ -1349,17 +1541,17 @@ def main():
                 cplan = trade_plan(copt, sig["atr"], cfg, int(lot_size), float(capital), float(risk_pct)) if copt["ok"] else None
                 if cplan and cplan["ok"]:
                     side_t = "CALL (CE)" if c_dir == "UP" else "PUT (PE)"
-                    st.success(f"🎯 **सहमती {len(c_agree)}/4: {side_t} खरेदी · {sym} {copt['strike']:.0f}** · Entry ~₹{cplan['entry']} · "
+                    st.success(f"🎯 **सहमती {len(c_agree)}/{n_eng}: {side_t} खरेदी · {sym} {copt['strike']:.0f}** · Entry ~₹{cplan['entry']} · "
                                f"SL ₹{cplan['sl']} · T1 ₹{cplan['t1']} · T2 ₹{cplan['t2']} · {cplan['lots']} lot · "
                                f"कमाल तोटा ₹{cplan['max_loss']:.0f}\n\nसहमत: {', '.join(c_agree)}"
                                + (f" · विरोधी: {', '.join(c_opp)}" if c_opp else ""))
                     if (in_trade_window(now, cfg.window_start, cfg.window_end)
                             and cooldown_ok(st.session_state["journal"], sym, c_dir, now_ts, cfg.cooldown_min, "cons-" + sig["candle"])):
                         tr2 = new_trade(sym, c_dir, expiry, copt, cplan, now_ts, "cons-" + sig["candle"], "agree" if flow_dir == c_dir else "none")
-                        tr2["mode"] = f"सहमती {len(c_agree)}/4"
+                        tr2["mode"] = f"सहमती {len(c_agree)}/{n_eng}"
                         st.session_state["journal"].append(tr2)
                         save_journal()
-                        send_telegram(f"🎯 {sym} सहमती {len(c_agree)}/4 ({', '.join(c_agree)}): {side_t} {copt['strike']:.0f} | "
+                        send_telegram(f"🎯 {sym} सहमती {len(c_agree)}/{n_eng} ({', '.join(c_agree)}): {side_t} {copt['strike']:.0f} | "
                                       f"Entry {cplan['entry']} SL {cplan['sl']} T1 {cplan['t1']} T2 {cplan['t2']} | {cplan['lots']} lot, "
                                       f"कमाल तोटा ₹{cplan['max_loss']:.0f}. सल्ला नाही.")
                 else:
@@ -1368,7 +1560,7 @@ def main():
             else:
                 st.info(f"⏳ **सहमती नाही**: किमान {min_agree} इंजिन एकाच दिशेला आणि कुणी विरोधात नसावे लागते.")
             st.dataframe(pd.DataFrame([vrow]), hide_index=True, use_container_width=True)
-            st.caption("चार्ट = पूर्ण सिग्नल किंवा फक्त 1 अट बाकी · OI flow = 2 मिनिटे टिकलेला · CAS = STRONG आणि LATE नाही · V40 = आत्ता सक्रिय सिग्नल. "
+            st.caption("चार्ट = पूर्ण सिग्नल किंवा फक्त 1 अट बाकी · OI flow = 2 मिनिटे टिकलेला · CAS = STRONG आणि LATE नाही · V40 = आत्ता सक्रिय सिग्नल · V34 = रँक ≥ 65 चा WINNER. "
                        "जास्त इंजिन सहमत म्हणजे जास्त खात्रीशीर असे सिद्ध नाही; Journal मध्ये 'सहमती 2/4', '3/4' चे निकाल वेगळे पाहून ठरवा.")
 
         st.info("हे इंडिकेटर-नियम आहेत, भाकीत नाही. SL/Target index ATR आणि delta वरून premium मध्ये काढले आहेत "
