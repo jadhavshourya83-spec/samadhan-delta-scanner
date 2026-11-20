@@ -376,4 +376,101 @@ r22b = L.find_commodity(comp, "CRUDEOIL", today="2026-10-29")
 assert r22b["ok"] and r22b["id"] == 111 and "FUTURE" in r22b["how"], r22b          # compact: nearest FUTURE (option expiry nantar)
 assert not L.find_commodity(_pd.DataFrame({"a": [1]}), "X")["ok"]
 print("22 OK MCX shodh:", r22["id"], r22["lot"], r22["step"], r22["expiry"], "| compact:", r22b["id"])
+
+# 23) OI data sanshayaspad + spot ulat dishene -> sanket baajula
+def _flow_case(oi_path, ltp_path, spot_path):
+    stx = {}
+    for j, (oi_, lt_) in enumerate(zip(oi_path, ltp_path)):
+        L.flow_update(stx, L.flow_key("NIFTY", "e", 25000, "ce"), 9000 + j * 30, lt_, oi_, 10 * j * 30)
+    stx["__spot__NIFTY"] = [(9000 + j * 30, sp_) for j, sp_ in enumerate(spot_path)]
+    ocx = {"25000.000000": {"ce": {"last_price": ltp_path[-1], "oi": oi_path[-1]}, "pe": {}}}
+    cfg_ = L.Cfg(flow_min_score=10.0)
+    return L.flow_rank(stx, "NIFTY", "e", ocx, spot_path[-1], cfg_, 50), stx
+n_ = 22
+oi_ok = [800000 * (1 + 0.012 * i) for i in range(n_)]          # OI hole-hole +25% (khara)
+lt_up = [100 * (1 + 0.012 * i) for i in range(n_)]
+flat_sp = [25000.0] * n_
+r_, st_ = _flow_case(oi_ok, lt_up, flat_sp)
+assert r_ and r_[0]["direction"] == "UP" and not st_["__flow_dropped__"], (r_, st_.get("__flow_dropped__"))
+oi_jump = [127000] * (n_ - 8) + [1045680] * 8                   # ek snapshot madhe 8x udi (tumchya CSV sarkhe)
+r2_, st2_ = _flow_case(oi_jump, lt_up, flat_sp)
+assert not r2_ and any("संशयास्पद" in x for x in st2_["__flow_dropped__"]), (r2_, st2_["__flow_dropped__"])
+fall_sp = [25000.0 - 4 * i for i in range(n_)]                  # spot ~ -0.34% khali, sanket UP
+r3_, st3_ = _flow_case(oi_ok, lt_up, fall_sp)
+assert not r3_ and any("उलट दिशेने" in x for x in st3_["__flow_dropped__"]), (r3_, st3_["__flow_dropped__"])
+rise_sp = [25000.0 + 4 * i for i in range(n_)]                  # spot var, sanket UP -> thevaycha
+r4_, _ = _flow_case(oi_ok, lt_up, rise_sp)
+assert r4_ and r4_[0]["direction"] == "UP"
+print("23 OK OI sanshayaspad ani spot-ulat sanket baajula")
+
+# 24) Signal tracker
+lg = []
+assert L.siglog_add(lg, 1000, "NIFTY", "e", "OI FLOW", "UP", 25000, "ce", 25000.0, 80, False)
+assert not L.siglog_add(lg, 1300, "NIFTY", "e", "OI FLOW", "UP", 25000, "ce", 25001.0, 80, False)     # 15 min madhe duhera nahi
+assert L.siglog_add(lg, 1300, "NIFTY", "e", "OI FLOW", "DOWN", 25000, "pe", 25001.0, 80, False)
+assert L.siglog_add(lg, 1300, "NIFTY", "e", "CAS EARLY", "UP", 25000, "pe", 25001.0, 60, True)
+assert not L.siglog_add(lg, 1300, "NIFTY", "e", "CHART", "WAIT", None, None, 25000.0, None, False)
+L.siglog_update(lg, 1400, "NIFTY", 25050.0)       # +0.2% (UP sathi HIT, DOWN sathi MISS)
+res = {(r["engine"], r["dir"]): r["result"] for r in lg}
+assert res[("OI FLOW", "UP")] == "HIT" and res[("OI FLOW", "DOWN")] == "MISS" and res[("CAS EARLY", "UP")] == "HIT", res
+lg2 = []
+L.siglog_add(lg2, 0, "NIFTY", "e", "CHART", "UP", None, None, 25000.0, None, False)
+L.siglog_update(lg2, 600, "NIFTY", 25005.0); assert lg2[0]["status"] == "OPEN"
+L.siglog_update(lg2, 3700, "NIFTY", 25005.0); assert lg2[0]["result"] == "NO MOVE"
+lg3 = []
+L.siglog_add(lg3, 0, "NIFTY", "e", "CHART", "UP", None, None, 25000.0, None, False)
+L.siglog_update(lg3, 6000, "NIFTY", 25100.0); assert lg3[0]["result"] == "NO DATA"                   # app band hota
+sm = L.siglog_summary(lg + lg2 + lg3)
+assert all(r["engine"] != "x" for r in sm) and sum(r["sanket"] for r in sm) == 4, sm
+oi_ = next(r for r in sm if r["engine"] == "OI FLOW")
+assert oi_["HIT"] == 1 and oi_["MISS"] == 1 and oi_["HIT % (HIT+MISS madhe)"] == 50.0, oi_
+print("24 OK signal tracker")
+
+# 25) V34 snippet: tumcha kod jasa ahe tasa chalto ka + winner kadhne
+import types, pathlib
+class _SS(dict):
+    __getattr__ = dict.get
+    def __setattr__(self, k, v): self[k] = v
+class _St:
+    def __init__(self): self.session_state = _SS()
+    def __getattr__(self, name):
+        if name == "empty" or name == "container":
+            class _C:
+                def __enter__(s): return s
+                def __exit__(s, *a): return False
+            return lambda *a, **k: _C()
+        return lambda *a, **k: None
+def _v34_run(ce_path, pe_path, scans=6):
+    stt = _St(); src = compile(pathlib.Path("v34_engine.py").read_text(encoding="utf-8"), "v34_engine.py", "exec")
+    g = None
+    for i in range(scans):
+        oc_ = {}
+        for k, strike in enumerate((80900, 81000, 81100)):
+            cl, pl = ce_path[i] * (1 - 0.05 * (k - 1)), pe_path[i] * (1 + 0.05 * (k - 1))
+            oc_[f"{strike}.000000"] = {"ce": {"last_price": cl, "oi": 1_000_000 * (1 + i * 0.8), "previous_oi": 1_000_000, "volume": 900000 + 800000 * i,
+                                              "prev_closing_price": 100.0, "greeks": {"delta": 0.5 + i * 0.01}},
+                                       "pe": {"last_price": pl, "oi": 400_000, "previous_oi": 400_000, "volume": 100000, "prev_closing_price": 100.0,
+                                              "greeks": {"delta": -0.5}}}
+        g = {"__name__": "v34_engine", "st": stt, "oc": oc_, "spot": 81000.0, "df_5": None, "main_sym": "SENSEX"}
+        exec(src, g)
+    return g
+up_ce = [100 * (1.06 ** i) for i in range(6)]; flat_pe = [100.0] * 6
+g_ = _v34_run(up_ce, flat_pe)
+assert g_.get("hero_list"), "V34 hero_list rikami"
+w_ = L.v34_winner(g_)
+assert w_ is None or (w_["dir"] == "UP" and w_["side"] == "ce"), w_
+assert L.v34_winner({"hero_list": [{"option": "SENSEX 81000 PE", "rank_score": 70, "type": "PUT"}], "is_equilibrium_active": False, "market_mode": "🟢 TRENDING"})["dir"] == "DOWN"
+assert L.v34_winner({"hero_list": [{"option": "SENSEX 81000 PE", "rank_score": 64, "type": "PUT"}], "is_equilibrium_active": False, "market_mode": "🟢 TRENDING"}) is None
+assert L.v34_winner({"hero_list": [{"option": "SENSEX 81000 CE", "rank_score": 90, "type": "CALL"}], "is_equilibrium_active": True, "market_mode": "x"}) is None
+print("25 OK V34 snippet chalto; winner:", w_ and (w_["option"], round(w_["score"], 1)))
+
+# 26) commodity: put-call parity varun khara underlying (tumcha NATURALGAS CSV: chain ATM 305, parity 293)
+_rows = {265: (28.7, .05), 270: (23, .05), 275: (18.1, .2), 280: (13.6, .45), 285: (9.4, 1.25), 290: (5.85, 2.85), 295: (3.25, 5.25),
+         300: (1.6, 8.65), 305: (.75, 12.75), 310: (.3, 17.3), 315: (.15, 22.2), 320: (.1, 26.95)}
+_oc = {f"{k}.000000": {"ce": {"last_price": c}, "pe": {"last_price": p}} for k, (c, p) in _rows.items()}
+imp = L.implied_spot(_oc)
+assert imp is not None and abs(imp - 293.0) < 0.3, imp
+assert L.implied_spot({"100.000000": {"ce": {"last_price": 5}, "pe": {"last_price": 5}}}) is None
+print("26 OK implied spot:", imp)
+
 print("\nSAGLYA CHACHNYA PASS")
