@@ -239,6 +239,55 @@ def evaluate_signal(d, cfg):
             "vol_ratio": vol_ratio, "candle": candle_key(d)}
 
 
+def continuation_signal(d, cfg):
+    """Trend continuation / pullback (PRAYOGIK). Jevha 'ताजा cross' nasto pan trend majbut asto ani bhav EMA9 pashi parat valun punha pudhe jato.
+    UP: DMI/VI/KST paiki >=2 vari, ADX>=25, EMA9>EMA20 ani EMA20 vadhtoy, gelya 8 candle madhe low EMA9 javal (<=0.25 ATR) aala,
+    atta close EMA9 chya vari ani maagchya candle chya high chya vari, RSI 45-72, EMA20 pasun <=1.5 ATR. DOWN: ulat.
+    Parat: {'direction': 'UP'|'DOWN'|None, 'checks': [...]}"""
+    if d is None or len(d) < 60:
+        return {"direction": None, "checks": []}
+    close, high, low = d["close"].astype(float), d["high"].astype(float), d["low"].astype(float)
+    pdi, mdi, adx = dmi(d)
+    vip, vim = vortex(d)
+    k, ks = kst(close)
+    e9, e20 = ema(close, 9), ema(close, 20)
+    r, a = rsi(close), atr(d)
+    c0, atr0 = float(close.iloc[-1]), float(a.iloc[-1])
+    if not (atr0 > 0):
+        return {"direction": None, "checks": []}
+    out = {}
+    for direction in ("UP", "DOWN"):
+        sg = 1 if direction == "UP" else -1
+        al = sum(1 for x, y in ((pdi, mdi), (vip, vim), (k, ks)) if (float(x.iloc[-1]) > float(y.iloc[-1])) == (direction == "UP"))
+        slope = (float(e20.iloc[-1]) - float(e20.iloc[-4])) * sg > 0
+        if direction == "UP":
+            order = float(e9.iloc[-1]) > float(e20.iloc[-1])
+            touched = any(float(low.iloc[-i]) <= float(e9.iloc[-i]) + 0.25 * atr0 for i in range(2, 10))
+            resume = c0 > float(e9.iloc[-1]) and c0 > float(high.iloc[-2])
+            rsi_ok = 45 <= float(r.iloc[-1]) <= 72
+        else:
+            order = float(e9.iloc[-1]) < float(e20.iloc[-1])
+            touched = any(float(high.iloc[-i]) >= float(e9.iloc[-i]) - 0.25 * atr0 for i in range(2, 10))
+            resume = c0 < float(e9.iloc[-1]) and c0 < float(low.iloc[-2])
+            rsi_ok = 28 <= float(r.iloc[-1]) <= 55
+        ext = (c0 - float(e20.iloc[-1])) * sg / atr0
+        checks = [("DMI, VI, KST पैकी ≥ 2 एकाच बाजूला", al >= 2, f"{al}/3"),
+                  ("ADX ≥ 25", float(adx.iloc[-1]) >= 25, f"{float(adx.iloc[-1]):.1f}"),
+                  ("EMA9/EMA20 दिशेनुसार आणि EMA20 त्याच दिशेने", bool(order and slope), f"EMA9 {float(e9.iloc[-1]):.1f}, EMA20 {float(e20.iloc[-1]):.1f}"),
+                  ("गेल्या 8 candle मध्ये EMA9 जवळ pullback", bool(touched), "होय" if touched else "नाही"),
+                  ("पुन्हा पुढे: close EMA9 पलीकडे आणि मागच्या candle च्या extreme पलीकडे", bool(resume), "होय" if resume else "नाही"),
+                  ("RSI " + ("45–72" if direction == "UP" else "28–55"), bool(rsi_ok), f"{float(r.iloc[-1]):.1f}"),
+                  ("EMA20 पासून ≤ 1.5 ATR", ext <= 1.5, f"{ext:.2f} ATR")]
+        out[direction] = (all(c[1] for c in checks), checks)
+    ok_up, ok_dn = out["UP"][0], out["DOWN"][0]
+    if ok_up and not ok_dn:
+        return {"direction": "UP", "checks": out["UP"][1]}
+    if ok_dn and not ok_up:
+        return {"direction": "DOWN", "checks": out["DOWN"][1]}
+    lean = "UP" if sum(c[1] for c in out["UP"][1]) >= sum(c[1] for c in out["DOWN"][1]) else "DOWN"
+    return {"direction": None, "checks": out[lean][1]}
+
+
 # ───────── time / expiry ─────────
 def in_trade_window(now, start, end):
     if now.weekday() >= 5:
@@ -698,6 +747,26 @@ def siglog_summary(log):
     return out
 
 
+MISS_WINDOW_MIN = 30
+
+
+def missed_move(hist, siglog, now_ts, sym, spot, thr_pct):
+    """Spot gelya 30 min madhe thr_pct% peksha jast halla ani tya disheche sanket (kontyahi engine che) tyachya aadhi/dorm. nondle nahit -> chukleli chaal.
+    hist = [(ts, spot), ...]. Parat: {'dir','mv','t0'} kinva None."""
+    pts = [(t, v) for t, v in hist if now_ts - MISS_WINDOW_MIN * 60 <= t <= now_ts and v]
+    if len(pts) < 5 or not spot:
+        return None
+    t0, s0 = pts[0]
+    mv = (spot / s0 - 1) * 100
+    if abs(mv) < thr_pct:
+        return None
+    d = "UP" if mv > 0 else "DOWN"
+    for r in siglog:
+        if r["sym"] == sym and r["dir"] == d and r["t"] >= t0 - MISS_WINDOW_MIN * 60:
+            return None
+    return {"dir": d, "mv": round(mv, 2), "t0": t0}
+
+
 # ───────── CAS v2: 'move chya aadhi' writers cha radar + sarvottam hedge ─────────
 def spot_move_pct(store, window_min, sym=""):
     """Spot ne shevtchya window madhe kiti % halla (+ var / - khali). Itihas kami asel tar None."""
@@ -985,6 +1054,7 @@ def main():
     IST = timezone(timedelta(hours=5, minutes=30))
     JOURNAL = Path(__file__).with_name("entry_journal.json")
     SIGLOG = Path(__file__).with_name("signal_log.json")
+    MISSLOG = Path(__file__).with_name("missed_moves.json")
 
     @st.cache_data(ttl=43200, show_spinner="Dhan instrument list उतरवत आहे (मोठी फाईल, पहिल्यांदा थोडा वेळ)...")
     def load_scrip_master():
@@ -1067,6 +1137,8 @@ def main():
             cas_strong = st.slider("STRONG score किमान", 50, 95, 70, 5)
             cas_late = st.slider("spot इतका हलला तर 'LATE' %", 0.1, 1.0, 0.40, 0.05)
         run_v40_on = st.checkbox("V40.2 OI इंजिन (तुमचा कोड) चालवा", True)
+        run_cont = st.checkbox("🔁 Trend continuation / pullback (प्रायोगिक)", True,
+                               help="ताजा cross नसलेल्या मजबूत ट्रेंडमध्ये EMA9 पर्यंत परत येऊन पुन्हा पुढे जाताना चार्टचे मत. एकटा entry देत नाही; सहमतीत एक मत म्हणून आणि tracker मध्ये नोंदला जातो.")
         run_v34_on = st.checkbox("V34 इंजिन (तुमचा कोड) चालवा (SENSEX / NIFTY)", False)
         tf_min = int(st.selectbox("⏱ Candle (मिनिटे)", [5, 3, 1], 0,
                                   help="लहान candle = सिग्नल लवकर पण जास्त खोटे. 3 किंवा 1 मिनिट Dhan/Tradehull ने समर्थित असावे (तपासलेले नाही). "
@@ -1115,6 +1187,12 @@ def main():
             st.session_state["siglog"] = json.loads(SIGLOG.read_text())
         except Exception:
             st.session_state["siglog"] = []
+    if "missed" not in st.session_state:
+        try:
+            st.session_state["missed"] = json.loads(MISSLOG.read_text())
+        except Exception:
+            st.session_state["missed"] = []
+    st.session_state.setdefault("spot_hist", {})
     st.session_state.setdefault("flow_store", {})
     st.session_state.setdefault("flow_top", [])
 
@@ -1226,7 +1304,24 @@ def main():
             return
         df, note = drop_forming_candle(raw, tf_min, now)
         sig = evaluate_signal(df, cfg)
-        if sig["close"] and spot and abs(spot / sig["close"] - 1) > meta.get("tol", 1.5) / 100:
+        cont = continuation_signal(df, cfg) if run_cont else {"direction": None, "checks": []}
+        # Chukleli chaal nondni: spot 30 min madhe motha halla ani konihi sanket dila nahi -> tya veli kay ada hota te nondva
+        _h = st.session_state["spot_hist"].setdefault(sym, [])
+        _h.append((now_ts, float(spot)))
+        del _h[:max(0, len(_h) - 400)]
+        _gap_block = bool(sig["close"] and spot and abs(spot / sig["close"] - 1) > meta.get("tol", 1.5) / 100)
+        _mm = missed_move(_h, st.session_state["siglog"], now_ts, sym, spot, 1.2 if meta.get("custom") else 0.4)
+        if _mm and not any(r["sym"] == sym and now_ts - r["t"] < 60 * 60 for r in st.session_state["missed"]):
+            st.session_state["missed"].append({
+                "t": now_ts, "sym": sym, "expiry": expiry, "dir": _mm["dir"], "mv_pct": _mm["mv"], "exp_day": (expiry == today),
+                "spot_gap_block": _gap_block, "chart_dir": sig.get("direction"), "cont_dir": cont.get("direction"), "leaning": sig.get("leaning"),
+                "failed": "; ".join(c[0] + " → " + str(c[2]) for c in sig.get("checks", []) if not c[1]),
+                "flow_dir": flow_dir, "mode": mode_name})
+            try:
+                MISSLOG.write_text(json.dumps(st.session_state["missed"]))
+            except Exception:
+                pass
+        if _gap_block:
             st.error(f"⚠ Chain चा spot ({spot:,.0f}) आणि चार्टचा भाव ({sig['close']:,.0f}) जुळत नाहीत "
                      f"(फरक {abs(spot / sig['close'] - 1) * 100:.1f}%, परवानगी {meta.get('tol', 1.5):.1f}%). "
                      f"Security id ({meta['id']}) {sym} चा आहे का तपासा. कमोडिटी असेल तर option चा future महिना आणि चार्टचा महिना वेगळा असू शकतो; "
@@ -1298,6 +1393,13 @@ def main():
             st.subheader("✅ चेकलिस्ट (झुकाव: " + {"UP": "वर", "DOWN": "खाली", "-": "—"}[sig["leaning"]] + ")")
             st.dataframe(pd.DataFrame([{"": "✅" if ok else "❌", "अट": n, "आत्ता": d} for n, ok, d in sig["checks"]]),
                          hide_index=True, use_container_width=True)
+            if run_cont and cont["checks"]:
+                with st.expander("🔁 Trend continuation / pullback (प्रायोगिक): " + (
+                        {"UP": "🟢 UP मत", "DOWN": "🔴 DOWN मत"}[cont["direction"]] if cont["direction"] else "मत नाही")):
+                    st.dataframe(pd.DataFrame([{"": "✅" if ok else "❌", "अट": n, "आत्ता": d} for n, ok, d in cont["checks"]]),
+                                 hide_index=True, use_container_width=True)
+                    st.caption("ताजा cross नसताना मजबूत ट्रेंडमध्ये pullback नंतर पुन्हा पुढे जाताना हे मत येते. एकटा entry नाही; सहमतीत एक मत आणि tracker मध्ये "
+                               "'CHART CONT (pullback)' म्हणून नोंद. प्रयोगात्मक, backtest नाही.")
         with c2:
             st.subheader("🎯 Option")
             if opt:
@@ -1369,6 +1471,8 @@ def main():
         _exp_day = (expiry == today)
         if sig["direction"] in ("UP", "DOWN"):
             siglog_add(SL_, now_ts, sym, expiry, "CHART", sig["direction"], None, None, spot, None, _exp_day)
+        if cont["direction"]:
+            siglog_add(SL_, now_ts, sym, expiry, "CHART CONT (pullback)", cont["direction"], None, None, spot, None, _exp_day)
         if enter:
             siglog_add(SL_, now_ts, sym, expiry, "ENTER (sahmati)", direction, opt["strike"], opt["side"], spot, None, _exp_day)
         if flow_ok and flow_best:
@@ -1414,6 +1518,13 @@ def main():
             st.caption(f"चालू (निकाल बाकी): {n_open}. HIT = सिग्नलच्या दिशेने spot +{SIG_X}% आधी गेला; MISS = उलट -{SIG_X}% आधी; "
                        f"NO MOVE = {SIG_HORIZON_MIN} मिनिटांत दोन्ही नाही. हे फक्त spot वर आधारित आहे (option premium, theta, SL धरलेले नाही). "
                        "Refresh च्या मधला wick चुकू शकतो. 30+ सिग्नल होईपर्यंत टक्केवारीवर विश्वास ठेवू नका. Streamlit Cloud वर फाईल रीस्टार्टवर पुसली जाते, म्हणून CSV उतरवून ठेवा.")
+            if st.session_state["missed"]:
+                st.markdown("**⚠ चुकलेल्या चाली** (spot 30 मिनिटांत खूप हलला आणि कुणीही आधी सिग्नल दिला नाही; तेव्हा कोणत्या अटी अपयशी होत्या)")
+                _md = pd.DataFrame(st.session_state["missed"])
+                _md["वेळ"] = pd.to_datetime(_md["t"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%d-%b %H:%M")
+                st.dataframe(_md[["वेळ", "sym", "dir", "mv_pct", "spot_gap_block", "chart_dir", "flow_dir", "failed", "exp_day"]].iloc[::-1],
+                             hide_index=True, use_container_width=True)
+                st.download_button("⬇ चुकलेल्या चाली CSV", _md.drop(columns=["वेळ"]).to_csv(index=False).encode(), "missed_moves.csv", "text/csv")
             if st.session_state["siglog"]:
                 _df = pd.DataFrame(st.session_state["siglog"])
                 _df["वेळ"] = pd.to_datetime(_df["t"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%d-%b %H:%M")
@@ -1526,7 +1637,7 @@ def main():
         v40_vs = st.session_state.get("v40_last_signal") if run_v40_on else None
         v40_act = bool(v40_vs and v40_vs.get("scan") == st.session_state.get("v40_scan_count"))
         cas_strong = next((c for c in cas_list if c["stage"] == "STRONG"), None)
-        votes = {"चार्ट": chart_vote(sig),
+        votes = {"चार्ट": chart_vote(sig) or cont["direction"],
                  "OI flow": flow_dir,
                  "CAS": (None if not cas_strong else ("UP" if cas_strong["bias"] == "BULLISH" else "DOWN")),
                  "V40": (("UP" if v40_vs["type"] == "CE" else "DOWN") if v40_act else None)}
