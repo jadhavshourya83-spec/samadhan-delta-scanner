@@ -473,4 +473,36 @@ assert imp is not None and abs(imp - 293.0) < 0.3, imp
 assert L.implied_spot({"100.000000": {"ce": {"last_price": 5}, "pe": {"last_price": 5}}}) is None
 print("26 OK implied spot:", imp)
 
+# 27) chukleli chaal nondni
+hist = [(i * 30.0, 300.0 + i * 0.1) for i in range(60)]              # 30 min madhe +~2%
+mm = L.missed_move(hist, [], 1770.0, "NATURALGAS", hist[-1][1], 1.2)
+assert mm and mm["dir"] == "UP" and mm["mv"] > 1.5, mm
+cov = [{"sym": "NATURALGAS", "dir": "UP", "t": 1000.0}]               # aadhi UP sanket hota -> chukleli nahi
+assert L.missed_move(hist, cov, 1770.0, "NATURALGAS", hist[-1][1], 1.2) is None
+cov2 = [{"sym": "NATURALGAS", "dir": "DOWN", "t": 1000.0}]            # ulat sanket = chukleli chaal
+assert L.missed_move(hist, cov2, 1770.0, "NATURALGAS", hist[-1][1], 1.2)
+assert L.missed_move(hist, [], 1770.0, "NATURALGAS", 300.5, 1.2) is None   # chhoti chaal
+assert L.missed_move(hist[:3], [], 90.0, "NATURALGAS", 301.0, 1.2) is None  # data kami
+print("27 OK chukleli chaal")
+
+# 28) trend continuation / pullback (synthetic: majbut trend + pullback + punha pudhe; sideways = mat nahi)
+import numpy as np
+def _mk(closes, rng):
+    c = np.array(closes, float); o = np.r_[c[0], c[:-1]]
+    h = np.maximum(c, o) + abs(rng.normal(0.5, 0.2, len(c))); l = np.minimum(c, o) - abs(rng.normal(0.5, 0.2, len(c)))
+    return pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": 1000})
+ups = dns = flats = 0
+for seed in range(40):
+    rng = np.random.default_rng(seed)
+    u = list(100 + np.arange(100) * 0.35 + rng.normal(0, 0.9, 100)); b = u[-1]; u += [b - 0.4, b - 1.2, b - 1.9, b - 1.5, b - 0.3, b + 1.2]
+    ups += L.continuation_signal(_mk(u, rng), L.Cfg())["direction"] == "UP"
+    d_ = list(200 - np.arange(100) * 0.35 + rng.normal(0, 0.9, 100)); b = d_[-1]; d_ += [b + 0.4, b + 1.2, b + 1.9, b + 1.5, b + 0.3, b - 1.2]
+    dns += L.continuation_signal(_mk(d_, rng), L.Cfg())["direction"] == "DOWN"
+    fl_ = list(100 + rng.normal(0, 0.6, 110))
+    flats += L.continuation_signal(_mk(fl_, rng), L.Cfg())["direction"] is not None
+assert ups >= 3 and dns >= 3, (ups, dns)           # kahi trend+pullback madhe mat yeta
+assert flats <= 3, flats                          # sideways madhe kvachit (<~7%) chukiche mat
+assert L.continuation_signal(None, L.Cfg())["direction"] is None
+print(f"28 OK trend continuation (synthetic: UP {ups}/40, DOWN {dns}/40, sideways false {flats}/40)")
+
 print("\nSAGLYA CHACHNYA PASS")
