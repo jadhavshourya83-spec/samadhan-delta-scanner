@@ -675,4 +675,14 @@ _old = _dd.iloc[:-1]
 assert len(L.daily_candles(_old, _n2, False)[0]) == len(_old)         # kalchi shevat: kayam dhartat
 print("33 OK daily candle aajchi")
 
+# 34) aajchi candle 5-min varun
+_d5 = _daily(_b, np.random.default_rng(2)); _d5["timestamp"] = pd.date_range(end="2026-11-20", periods=len(_d5), freq="B")
+_im = pd.DataFrame({"timestamp": pd.date_range("2026-11-23 09:15", periods=60, freq="5min"), "open": 100 + np.arange(60) * 0.1,
+                    "high": 101 + np.arange(60) * 0.1, "low": 99 + np.arange(60) * 0.1, "close": 100.5 + np.arange(60) * 0.1, "volume": 10})
+_o, _ok = L.add_today_from_intraday(_d5, _im, _dt(2026, 11, 23, 15, 0))
+assert _ok and len(_o) == len(_d5) + 1 and float(_o["high"].iloc[-1]) == float(_im["high"].max()) and float(_o["volume"].iloc[-1]) == 600
+assert not L.add_today_from_intraday(_o, _im, _dt(2026, 11, 23, 15, 0))[1]            # dusryanda jodat nahi
+assert L.scan_stock_daily(_o, _dt(2026, 11, 23, 16, 0), 10, 7, 5, 20.0, 1.0, 0.4, 3, 5, 15.0, True)["asof"] == "23-Nov"
+print("34 OK aajchi candle 5-min varun")
+
 print("\nSAGLYA CHACHNYA PASS")
