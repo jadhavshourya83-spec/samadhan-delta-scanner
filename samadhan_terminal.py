@@ -1050,8 +1050,25 @@ STOCK_LIST = [
 ]
 
 
-def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3):
-    """Ek stock cha daily candle var Monthly HOLD nikal. status: FRESH / LATE / PULLBACK READY / WAIT / data apura."""
+SECTOR = {
+    "HDFCBANK": "बँका", "ICICIBANK": "बँका", "SBIN": "बँका", "AXISBANK": "बँका", "KOTAKBANK": "बँका", "INDUSINDBK": "बँका",
+    "BAJFINANCE": "फायनान्स/विमा", "BAJAJFINSV": "फायनान्स/विमा", "SBILIFE": "फायनान्स/विमा",
+    "TCS": "IT", "INFY": "IT", "WIPRO": "IT", "HCLTECH": "IT", "TECHM": "IT",
+    "MARUTI": "ऑटो", "M&M": "ऑटो", "EICHERMOT": "ऑटो", "HEROMOTOCO": "ऑटो",
+    "TATASTEEL": "मेटल/खाण", "JSWSTEEL": "मेटल/खाण", "HINDALCO": "मेटल/खाण", "COALINDIA": "मेटल/खाण",
+    "RELIANCE": "ऊर्जा", "ONGC": "ऊर्जा", "BPCL": "ऊर्जा", "NTPC": "ऊर्जा", "POWERGRID": "ऊर्जा",
+    "ITC": "FMCG", "HINDUNILVR": "FMCG", "NESTLEIND": "FMCG", "BRITANNIA": "FMCG", "TATACONSUM": "FMCG",
+    "SUNPHARMA": "फार्मा/हेल्थ", "DRREDDY": "फार्मा/हेल्थ", "CIPLA": "फार्मा/हेल्थ", "DIVISLAB": "फार्मा/हेल्थ", "APOLLOHOSP": "फार्मा/हेल्थ",
+    "LT": "इन्फ्रा/सिमेंट", "ULTRACEMCO": "इन्फ्रा/सिमेंट", "GRASIM": "इन्फ्रा/सिमेंट", "ADANIPORTS": "इन्फ्रा/सिमेंट", "ADANIENT": "इन्फ्रा/सिमेंट",
+    "TITAN": "ग्राहक", "ASIANPAINT": "ग्राहक", "BHARTIARTL": "टेलिकॉम",
+}
+
+
+def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3,
+                     form_aligned=5, form_adx=15.0):
+    """Ek stock cha daily candle var Monthly HOLD nikal.
+    status: FRESH (sarva jule, move kami) / FORMING (tayar hot ahe: 5+ indicators, move kami) / LATE (move nighun gela)
+            / PULLBACK READY / WAIT / data apura."""
     df, _ = drop_forming_candle(raw, 1440, now)             # chalu (apurna) divsachi candle vagale jate
     if df is None or len(df) < 70:
         return {"status": "डेटा अपुरा", "direction": "-", "aligned": 0, "adx": 0.0, "move_atr": 0.0,
@@ -1059,6 +1076,7 @@ def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20
     sig = monthly_hold_signal(df, window, min_aligned, min_fresh, adx_min)
     pb = monthly_pullback(df, window, min_aligned, adx_min, retrace, pb_aligned)
     late = bool(pb and pb["move_atr"] > late_atr)
+    aligned, move, level = int(sig.get("aligned", 0)), float(pb["move_atr"]) if pb else 0.0, float(pb["level"]) if pb else None
     if late and pb["ready"]:
         status, direction = "PULLBACK READY", pb["direction"]
     elif late:
@@ -1067,9 +1085,87 @@ def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20
         status, direction = "FRESH", sig["direction"]
     else:
         status, direction = "WAIT", sig.get("leaning", "-")
-    return {"status": status, "direction": direction, "aligned": int(sig.get("aligned", 0)), "adx": float(dmi(df)[2].iloc[-1]),
-            "move_atr": float(pb["move_atr"]) if pb else 0.0, "level": float(pb["level"]) if pb else None,
-            "close": float(df["close"].iloc[-1]), "note": ""}
+        pf = monthly_pullback(df, window, form_aligned, form_adx, retrace, pb_aligned)
+        if pf and pf["bars_ago"] == 0 and pf["move_atr"] <= late_atr:   # aata 5+ indicators ekach bajula ani move ajun kami = tayar hot ahe
+            status, direction, aligned, move, level = "FORMING", pf["direction"], pf["aligned_now"], float(pf["move_atr"]), float(pf["level"])
+    return {"status": status, "direction": direction, "aligned": aligned, "adx": float(dmi(df)[2].iloc[-1]),
+            "move_atr": move, "level": level, "close": float(df["close"].iloc[-1]), "note": ""}
+
+
+def _ci_col(df, *needles):
+    for c in df.columns:
+        u = str(c).upper()
+        if all(n in u for n in needles):
+            return c
+    return None
+
+
+def stock_security_id(tsl, sym, overrides=None):
+    """Stock cha (cash/equity) Dhan security id. Manual override > Tradehull instrument_df (TAPASLE NAHI; column naave andaje)."""
+    if overrides and sym in overrides:
+        return overrides[sym]
+    try:
+        df = getattr(tsl, "instrument_df", None)
+        if df is None:
+            return None
+        c_id, c_sym = _ci_col(df, "SECURITY_ID"), _ci_col(df, "TRADING_SYMBOL")
+        c_ins, c_exc = _ci_col(df, "INSTRUMENT_NAME") or _ci_col(df, "INSTRUMENT"), _ci_col(df, "EXCH_ID")
+        if not c_id or not c_sym:
+            return None
+        m = df[c_sym].astype(str).str.upper() == sym.upper()
+        if c_ins:
+            m &= df[c_ins].astype(str).str.upper().str.contains("EQUITY|EQ", regex=True)
+        if c_exc:
+            m &= df[c_exc].astype(str).str.upper().str.contains("NSE")
+        r = df[m]
+        return int(float(r.iloc[0][c_id])) if len(r) else None
+    except Exception:
+        return None
+
+
+def stock_lot_size(tsl, sym):
+    """Stock option cha lot (TAPASLE NAHI; nasel tar None)."""
+    try:
+        df = getattr(tsl, "instrument_df", None)
+        c_sym, c_lot = _ci_col(df, "TRADING_SYMBOL"), _ci_col(df, "LOT")
+        if df is None or not c_sym or not c_lot:
+            return None
+        r = df[df[c_sym].astype(str).str.upper().str.startswith(sym.upper() + "-")]
+        return int(float(r.iloc[0][c_lot])) if len(r) else None
+    except Exception:
+        return None
+
+
+def stock_strike_pick(d_api, tsl, sym, direction, now, d_lo, d_hi, min_oi, max_spread, overrides=None):
+    """Stock cha monthly option strike (delta pattyat). Nikal dict; error asel tar 'err'."""
+    sid = stock_security_id(tsl, sym, overrides)
+    if not sid:
+        return {"symbol": sym, "err": "security id मिळाला नाही (SYMBOL=ID असा हाताने द्या)"}
+    try:
+        today = now.strftime("%Y-%m-%d")
+        exps = [e for e in extract_dates(d_api.expiry_list(under_security_id=sid, under_exchange_segment="NSE_EQ")) if e >= today]
+        mon = monthly_expiries(exps)
+        far = [e for e in mon if (datetime.strptime(e, "%Y-%m-%d") - now).days >= 7]
+        exp = (far or mon or exps or [None])[0]
+        if not exp:
+            return {"symbol": sym, "err": "expiry मिळाली नाही"}
+        resp = d_api.option_chain(under_security_id=sid, under_exchange_segment="NSE_EQ", expiry=exp)
+        data = (resp or {}).get("data", {}).get("data") if isinstance(resp, dict) else None
+        if not data or "oc" not in data:
+            return {"symbol": sym, "err": f"chain मिळाली नाही: {str(resp)[:80]}"}
+        spot, oc = float(data.get("last_price", 0)), data["oc"]
+        ks = sorted(strike_map(oc))
+        step = min((b - a for a, b in zip(ks, ks[1:]) if b > a), default=1.0)
+        o = pick_by_delta(oc, direction, d_lo, d_hi, spot, step, min_oi, max_spread)
+        if "strike" not in o:
+            return {"symbol": sym, "err": "; ".join(o.get("issues", [])) or "strike मिळाला नाही"}
+        lot = stock_lot_size(tsl, sym)
+        return {"symbol": sym, "expiry": exp, "strike": o["strike"], "side": "CE" if direction == "UP" else "PE", "ltp": o["ltp"],
+                "delta": o["delta"], "oi": o["oi"], "spread": o["spread_pct"], "lot": lot,
+                "cost": (o["ltp"] * lot) if lot else None, "spot": spot,
+                "warn": "; ".join(o.get("warn", []) + o.get("issues", []))}
+    except Exception as e:
+        return {"symbol": sym, "err": str(e)[:100]}
 
 
 def monthly_expiries(exp_list):
@@ -1530,40 +1626,86 @@ def main():
 
         # ───────── Stock scanner (1 DAY candle, F&O stocks) ─────────
         with st.expander("📊 Stock scanner (1 DAY candle · F&O stocks)", expanded=False):
-            st.caption("Monthly HOLD चाच फॉर्म्युला (KST, DMI, MOM, MACD, ALMA, HMA, VI, EMA9) रोजच्या candle वर. Strike इथे नाही; उमेदवार स्टॉक्स मिळतात. बॅकटेस्ट नाही.")
+            st.caption("Monthly HOLD चाच फॉर्म्युला (KST, DMI, MOM, MACD, ALMA, HMA, VI, EMA9) रोजच्या candle वर. "
+                       "डीफॉल्ट: फक्त **मूव्ह आधी झालेला नसलेले** स्टॉक्स (FRESH = सर्व जुळले, FORMING = तयार होत आहे) आणि त्यांची दिशा. बॅकटेस्ट नाही.")
             _stx = st.text_area("Stocks (स्वल्पविराम किंवा नवी ओळ)", ", ".join(STOCK_LIST), height=90, key="ss_txt")
             _c1, _c2, _c3, _c4 = st.columns(4)
             _sw = _c1.number_input("खिडकी (दिवस)", 2, 60, 10, key="ss_w")
-            _sa = _c2.number_input("किमान एकमत /8", 4, 8, 7, key="ss_a")
-            _sf = _c3.number_input("किमान ताजे cross", 0, 8, 5, key="ss_f")
+            _sa = _c2.number_input("FRESH: किमान एकमत /8", 4, 8, 7, key="ss_a")
+            _sf = _c3.number_input("FRESH: किमान cross", 0, 8, 5, key="ss_f")
             _sx = _c4.number_input("ADX किमान", 10.0, 40.0, 20.0, 1.0, key="ss_x")
-            _sall = st.checkbox("WAIT सुद्धा दाखवा", False, key="ss_all")
+            _d1, _d2, _d3 = st.columns(3)
+            _sl = _d1.number_input("मूव्ह जास्तीत जास्त (ATR) — यापेक्षा जास्त = निघून गेला", 0.3, 5.0, 1.0, 0.1, key="ss_late")
+            _sfo = _d2.number_input("FORMING: किमान एकमत /8", 3, 7, 5, key="ss_form")
+            _sfx = _d3.number_input("FORMING: ADX किमान", 5.0, 30.0, 15.0, 1.0, key="ss_fx")
+            _sm, _sall = st.checkbox("PULLBACK READY / LATE सुद्धा दाखवा", False, key="ss_more"), st.checkbox("WAIT सुद्धा दाखवा", False, key="ss_all")
             if st.button("🔍 स्कॅन करा (1 DAY)", key="ss_go"):
                 _syms = [x.strip().upper() for x in _stx.replace("\n", ",").split(",") if x.strip()]
                 _bar, _rows, _fail = st.progress(0.0), [], []
                 for _i, _sy in enumerate(_syms, 1):
                     try:
                         _raw = tsl.get_historical_data(_sy, "NSE", "DAY")
-                        _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx))
-                        _r["symbol"] = _sy
+                        _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx), float(_sl), 0.4, 3, int(_sfo), float(_sfx))
+                        _r["symbol"], _r["sector"] = _sy, SECTOR.get(_sy, "इतर")
                         _rows.append(_r)
                     except Exception as _e:
                         _fail.append(f"{_sy}: {str(_e)[:80]}")
                     _bar.progress(_i / max(1, len(_syms)))
                     time.sleep(1.0)
                 st.session_state["stock_scan"] = {"rows": _rows, "fail": _fail, "t": now}
+                st.session_state.pop("stock_strikes", None)
             _res = st.session_state.get("stock_scan")
             if _res:
-                _pr = {"PULLBACK READY": 0, "FRESH": 1, "LATE": 2, "WAIT": 3}
-                _show = [r for r in _res["rows"] if _sall or r["status"] != "WAIT"]
-                _show.sort(key=lambda r: (_pr.get(r["status"], 9), -r["aligned"], -r["adx"]))
+                _pr = {"FORMING": 0, "FRESH": 1, "PULLBACK READY": 2, "LATE": 3, "WAIT": 4}
+                _early = ("FORMING", "FRESH")
+                _show = [r for r in _res["rows"] if r["status"] in _early or (_sm and r["status"] in ("PULLBACK READY", "LATE")) or _sall]
+                _show.sort(key=lambda r: (_pr.get(r["status"], 9), r.get("sector", ""), -r["aligned"], -r["adx"]))
                 st.caption(f"निकाल {_res['t']:%d-%b %H:%M} · {len(_res['rows'])} पैकी {len(_show)} दाखवले")
+                # क्षेत्र सारांश (सर्व स्कॅन केलेल्या स्टॉक्सवरून)
+                _sec = {}
+                for r in _res["rows"]:
+                    d_ = _sec.setdefault(r.get("sector", "इतर"), {"क्षेत्र": r.get("sector", "इतर"), "स्टॉक्स": 0, "UP": 0, "DOWN": 0, "तयार/ताजे (UP)": 0, "तयार/ताजे (DOWN)": 0})
+                    d_["स्टॉक्स"] += 1
+                    if r["direction"] in ("UP", "DOWN") and r["status"] != "डेटा अपुरा":
+                        d_[r["direction"]] += 1
+                        if r["status"] in _early:
+                            d_["तयार/ताजे (" + r["direction"] + ")"] += 1
+                _sd0 = pd.DataFrame(list(_sec.values())).sort_values(["तयार/ताजे (UP)", "तयार/ताजे (DOWN)"], ascending=False)
+                st.markdown("**क्षेत्रानुसार झुकाव** (UP/DOWN = सर्व स्कॅन केलेल्या स्टॉक्सची दिशा, 'LATE' सहित)")
+                st.dataframe(_sd0, hide_index=True, use_container_width=True)
                 if _show:
-                    _sd = pd.DataFrame(_show)[["symbol", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]]
+                    _sd = pd.DataFrame(_show)[["symbol", "sector", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]]
                     st.dataframe(_sd.round(2), hide_index=True, use_container_width=True)
                     st.download_button("⬇ CSV", _sd.to_csv(index=False).encode("utf-8-sig"), "stock_scan.csv", "text/csv", key="ss_dl")
+                    _ids_txt = st.text_input("Security id हाताने (पर्यायी): SYMBOL=ID, स्वल्पविराम", "", key="ss_ids",
+                                             help="Strike साठी स्टॉकचा Dhan security id लागतो. स्वयंचलित शोध तपासलेला नाही; नाही मिळाला तर इथे द्या.")
+                    _cand = [r for r in _show if r["status"] in _early][:10]
+                    if _cand and st.button(f"🎯 या {len(_cand)} स्टॉक्सचा monthly strike दाखवा (delta {m_dlo:g}–{m_dhi:g})", key="ss_strike"):
+                        _ov = {}
+                        for t_ in _ids_txt.split(","):
+                            if "=" in t_:
+                                k_, v_ = t_.split("=", 1)
+                                try:
+                                    _ov[k_.strip().upper()] = int(v_.strip())
+                                except ValueError:
+                                    pass
+                        _out = []
+                        for r in _cand:
+                            o_ = stock_strike_pick(d_api, tsl, r["symbol"], r["direction"], now, float(m_dlo), float(m_dhi), float(m_oi), float(m_spread), _ov)
+                            o_["status"], o_["direction"] = r["status"], r["direction"]
+                            _out.append(o_)
+                            time.sleep(1.0)
+                        st.session_state["stock_strikes"] = _out
+                    _sk = st.session_state.get("stock_strikes")
+                    if _sk:
+                        _t = pd.DataFrame([{"symbol": o.get("symbol"), "दिशा": o.get("direction"), "expiry": o.get("expiry", ""),
+                                            "strike": o.get("strike"), "CE/PE": o.get("side", ""), "LTP": o.get("ltp"), "delta": o.get("delta"),
+                                            "OI": o.get("oi"), "spread%": o.get("spread"), "1 lot खर्च ₹": o.get("cost"), "lot": o.get("lot"),
+                                            "इशारा/त्रुटी": o.get("err") or o.get("warn", "")} for o in _sk])
+                        st.dataframe(_t.round(2), hide_index=True, use_container_width=True)
+                        st.caption("lot आणि security id स्वयंचलित शोध तपासलेला नाही. 'lot' रिकामा असेल तर 1 lot चा खर्च तुमच्या ब्रोकरवर तपासा. आर्थिक सल्ला नाही.")
                 else:
-                    st.info("एकही stock अटीत बसत नाही.")
+                    st.info("आत्ता मूव्ह सुरू व्हायच्या स्थितीत एकही stock नाही (LATE/PULLBACK पाहायचे असेल तर वरचा चेकबॉक्स).")
                 if _res["fail"]:
                     st.warning("तुटलेले (symbol/timeframe तपासा): " + "; ".join(_res["fail"][:10]))
 
