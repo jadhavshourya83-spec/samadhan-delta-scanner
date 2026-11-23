@@ -34,12 +34,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 DEFAULT_STOCKS = T.STOCK_LIST
 
-PRIORITY = {"PULLBACK READY": 0, "FRESH": 1, "LATE": 2, "WAIT": 3}
+PRIORITY = {"FORMING": 0, "FRESH": 1, "PULLBACK READY": 2, "LATE": 3, "WAIT": 4}
 
 
-def scan_one(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3):
+def scan_one(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.0, retrace=0.4, pb_aligned=3, form_aligned=5, form_adx=15.0):
     """Ek stock cha nikal dict (logic terminal madhe: T.scan_stock_daily)."""
-    return T.scan_stock_daily(raw, now, window, min_aligned, min_fresh, adx_min, late_atr, retrace, pb_aligned)
+    return T.scan_stock_daily(raw, now, window, min_aligned, min_fresh, adx_min, late_atr, retrace, pb_aligned, form_aligned, form_adx)
 
 
 def fetch_daily(tsl, sym, exch, tf):
@@ -57,7 +57,7 @@ def send_telegram(text):
 
 
 def format_rows(rows, show_all):
-    rows = [r for r in rows if show_all or r["status"] != "WAIT"]
+    rows = [r for r in rows if show_all or r["status"] in ("FORMING", "FRESH")]
     rows.sort(key=lambda r: (PRIORITY.get(r["status"], 9), -r["aligned"], -r["adx"]))
     return rows
 
@@ -72,11 +72,11 @@ def main():
     ap.add_argument("--min-aligned", type=int, default=7)
     ap.add_argument("--min-fresh", type=int, default=5)
     ap.add_argument("--adx", type=float, default=20.0)
-    ap.add_argument("--late-atr", type=float, default=1.5)
+    ap.add_argument("--late-atr", type=float, default=1.0, help="move yapeksha jast ATR = nighun gela")
     ap.add_argument("--retrace", type=float, default=0.4)
     ap.add_argument("--pb-aligned", type=int, default=3)
     ap.add_argument("--delay", type=float, default=1.0, help="don mangnyanmadhe sekand (Dhan limit sathi; limit mahit nahi)")
-    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--all", action="store_true", help="LATE/PULLBACK/WAIT sahit sarva dakhav")
     ap.add_argument("--telegram", action="store_true")
     ap.add_argument("--out", default="stock_scan.csv")
     a = ap.parse_args()
@@ -100,7 +100,7 @@ def main():
         try:
             raw = fetch_daily(tsl, sym, a.exch, a.tf)
             r = scan_one(raw, now, a.window, a.min_aligned, a.min_fresh, a.adx, a.late_atr, a.retrace, a.pb_aligned)
-            r["symbol"] = sym
+            r["symbol"], r["sector"] = sym, T.SECTOR.get(sym, "इतर")
             rows.append(r)
         except Exception as e:
             failed.append((sym, str(e)[:120]))
@@ -109,7 +109,7 @@ def main():
     print()
 
     show = format_rows(rows, a.all)
-    cols = ["symbol", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]
+    cols = ["symbol", "sector", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]
     df = pd.DataFrame(show, columns=cols) if show else pd.DataFrame(columns=cols)
     df.to_csv(a.out, index=False, encoding="utf-8-sig")
     print(df.round(2).to_string(index=False) if len(df) else "आज एकही stock अटीत बसत नाही.")
