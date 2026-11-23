@@ -1064,12 +1064,30 @@ SECTOR = {
 }
 
 
+def daily_candles(raw, now, live=False):
+    """Daily candle: aajchi candle kadhi dhaaychi?
+    live=True: aajchi chalu (apurna) candle dhara (aajcha bhav, badalu shakto). live=False: aajchi candle fakt 15:35 nantar (bajar band zalyavar) dhara."""
+    if raw is None or len(raw) == 0:
+        return raw, "डेटा नाही"
+    ts = _timestamps(raw)
+    if ts is None:
+        return raw, "timestamp नाही"
+    last_day = ts.iloc[-1].normalize()
+    if last_day == pd.Timestamp(now).normalize():
+        if live:
+            return raw, "आजची चालू candle धरली (live)"
+        if now.hour * 60 + now.minute >= 15 * 60 + 35:
+            return raw, "आजची पूर्ण candle धरली"
+        return raw.iloc[:-1], "आजची अपूर्ण candle वगळली"
+    return raw, "शेवटची पूर्ण candle " + f"{ts.iloc[-1]:%d-%b}"
+
+
 def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3,
-                     form_aligned=5, form_adx=15.0):
+                     form_aligned=5, form_adx=15.0, live=False):
     """Ek stock cha daily candle var Monthly HOLD nikal.
     status: FRESH (sarva jule, move kami) / FORMING (tayar hot ahe: 5+ indicators, move kami) / LATE (move nighun gela)
             / PULLBACK READY / WAIT / data apura."""
-    df, _ = drop_forming_candle(raw, 1440, now)             # chalu (apurna) divsachi candle vagale jate
+    df, _ = daily_candles(raw, now, live)
     if df is None or len(df) < 70:
         return {"status": "डेटा अपुरा", "direction": "-", "aligned": 0, "adx": 0.0, "move_atr": 0.0,
                 "level": None, "close": None, "note": f"candle {0 if df is None else len(df)} (किमान 70)"}
@@ -1655,13 +1673,15 @@ def main():
             _sfo = _d2.number_input("FORMING: किमान एकमत /8", 3, 7, 5, key="ss_form")
             _sfx = _d3.number_input("FORMING: ADX किमान", 5.0, 30.0, 15.0, 1.0, key="ss_fx")
             _sm, _sall = st.checkbox("PULLBACK READY / LATE सुद्धा दाखवा", False, key="ss_more"), st.checkbox("WAIT सुद्धा दाखवा", False, key="ss_all")
+            _slive = st.checkbox("आजची चालू candle धरा (live: आजचा भाव, दिवसभर बदलू शकतो)", True, key="ss_live",
+                                 help="बंद केल्यास आजची candle फक्त 15:35 नंतर (बाजार बंद झाल्यावर) धरली जाते. चालू असताना सिग्नल बदलू शकतात.")
             if st.button("🔍 स्कॅन करा (1 DAY)", key="ss_go"):
                 _syms = [x.strip().upper() for x in _stx.replace("\n", ",").split(",") if x.strip()]
                 _bar, _rows, _fail = st.progress(0.0), [], []
                 for _i, _sy in enumerate(_syms, 1):
                     try:
                         _raw = tsl.get_historical_data(_sy, "NSE", "DAY")
-                        _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx), float(_sl), 0.4, 3, int(_sfo), float(_sfx))
+                        _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx), float(_sl), 0.4, 3, int(_sfo), float(_sfx), bool(_slive))
                         _r["symbol"], _r["sector"] = _sy, SECTOR.get(_sy, "इतर")
                         _rows.append(_r)
                     except Exception as _e:
