@@ -654,4 +654,15 @@ sp2 = L.stock_strike_pick(_FakeAPI(), type("T", (), {})(), "ZZZ", "UP", _now, 0.
 assert "err" in sp2
 print("31 OK FORMING/sector/stock strike:", form, sp["strike"], sp["expiry"], sp["lot"])
 
+# 32) stock_rank
+_rk = [dict(symbol="A", sector="IT", status="FRESH", direction="DOWN", aligned=8, adx=30.0, move_atr=0.1),
+       dict(symbol="B", sector="IT", status="FORMING", direction="DOWN", aligned=5, adx=16.0, move_atr=0.9),
+       dict(symbol="C", sector="FMCG", status="FRESH", direction="UP", aligned=8, adx=30.0, move_atr=0.1),
+       dict(symbol="D", sector="IT", status="LATE", direction="DOWN", aligned=8, adx=40.0, move_atr=3.0),
+       dict(symbol="E", sector="IT", status="WAIT", direction="UP", aligned=3, adx=10.0, move_atr=0.0)]
+L.stock_rank(_rk, 1.0)
+assert _rk[0]["score"] > _rk[1]["score"] and _rk[0]["score"] > _rk[2]["score"], [r["score"] for r in _rk]   # kshetra-sathidar (IT madhe 2 DOWN) vadhavto
+assert _rk[3]["score"] is None and _rk[4]["score"] is None and "ATR" in _rk[0]["why"]
+print("32 OK stock_rank:", [r["score"] for r in _rk])
+
 print("\nSAGLYA CHACHNYA PASS")
