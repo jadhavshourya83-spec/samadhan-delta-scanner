@@ -665,4 +665,14 @@ assert _rk[0]["score"] > _rk[1]["score"] and _rk[0]["score"] > _rk[2]["score"], 
 assert _rk[3]["score"] is None and _rk[4]["score"] is None and "ATR" in _rk[0]["why"]
 print("32 OK stock_rank:", [r["score"] for r in _rk])
 
+# 33) daily candle: aajchi candle kadhi?
+_dd = _daily(_b, np.random.default_rng(1)); _dd["timestamp"] = pd.date_range(end="2026-11-23", periods=len(_dd), freq="D")
+_n1, _n2 = _dt(2026, 11, 23, 12, 0), _dt(2026, 11, 23, 16, 0)
+assert len(L.daily_candles(_dd, _n1, False)[0]) == len(_dd) - 1        # bajar chalu, live nahi: aajchi candle vagali
+assert len(L.daily_candles(_dd, _n1, True)[0]) == len(_dd)             # live: aajchi dhartat
+assert len(L.daily_candles(_dd, _n2, False)[0]) == len(_dd)            # bajar band (15:35 nantar): aajchi pura candle dhartat
+_old = _dd.iloc[:-1]
+assert len(L.daily_candles(_old, _n2, False)[0]) == len(_old)         # kalchi shevat: kayam dhartat
+print("33 OK daily candle aajchi")
+
 print("\nSAGLYA CHACHNYA PASS")
