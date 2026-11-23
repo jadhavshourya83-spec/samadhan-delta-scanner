@@ -1064,6 +1064,31 @@ SECTOR = {
 }
 
 
+def add_today_from_intraday(daily, intra, now):
+    """Dhan cha 'DAY' data aajchi candle det nasel tar, aajchya 5-min candle varun aajchi daily candle banavto. (daily, kela ka)"""
+    try:
+        ts_d, ts_i = _timestamps(daily), _timestamps(intra)
+        if ts_d is None or ts_i is None:
+            return daily, False
+        today = pd.Timestamp(now).normalize()
+        if ts_d.iloc[-1].normalize() >= today:
+            return daily, False
+        t = intra[(ts_i.dt.normalize() == today).values]
+        if len(t) == 0:
+            return daily, False
+        row = {"open": float(t["open"].iloc[0]), "high": float(t["high"].max()), "low": float(t["low"].min()),
+               "close": float(t["close"].iloc[-1]), "volume": float(t["volume"].sum()) if "volume" in t.columns else 0.0}
+        if isinstance(daily.index, pd.DatetimeIndex):
+            out = pd.concat([daily, pd.DataFrame([row], index=pd.DatetimeIndex([today], tz=daily.index.tz))])
+        else:
+            col = next(c for c in ("timestamp", "time", "datetime", "date") if c in daily.columns)
+            row[col] = today
+            out = pd.concat([daily, pd.DataFrame([row])], ignore_index=True)
+        return out, True
+    except Exception:
+        return daily, False
+
+
 def daily_candles(raw, now, live=False):
     """Daily candle: aajchi candle kadhi dhaaychi?
     live=True: aajchi chalu (apurna) candle dhara (aajcha bhav, badalu shakto). live=False: aajchi candle fakt 15:35 nantar (bajar band zalyavar) dhara."""
@@ -1107,7 +1132,8 @@ def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20
         if pf and pf["bars_ago"] == 0 and pf["move_atr"] <= late_atr:   # aata 5+ indicators ekach bajula ani move ajun kami = tayar hot ahe
             status, direction, aligned, move, level = "FORMING", pf["direction"], pf["aligned_now"], float(pf["move_atr"]), float(pf["level"])
     return {"status": status, "direction": direction, "aligned": aligned, "adx": float(dmi(df)[2].iloc[-1]),
-            "move_atr": move, "level": level, "close": float(df["close"].iloc[-1]), "note": ""}
+            "move_atr": move, "level": level, "close": float(df["close"].iloc[-1]), "note": "",
+            "asof": (lambda t: f"{t.iloc[-1]:%d-%b}" if t is not None else "")(_timestamps(df))}
 
 
 def stock_rank(rows, late_atr=1.0):
@@ -1681,6 +1707,11 @@ def main():
                 for _i, _sy in enumerate(_syms, 1):
                     try:
                         _raw = tsl.get_historical_data(_sy, "NSE", "DAY")
+                        _t0 = _timestamps(_raw)
+                        if now.weekday() < 5 and now.hour * 60 + now.minute >= 9 * 60 + 20 and _t0 is not None \
+                                and _t0.iloc[-1].normalize() < pd.Timestamp(now).normalize():
+                            _raw, _added = add_today_from_intraday(_raw, tsl.get_historical_data(_sy, "NSE", "5"), now)
+                            time.sleep(0.5)
                         _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx), float(_sl), 0.4, 3, int(_sfo), float(_sfx), bool(_slive))
                         _r["symbol"], _r["sector"] = _sy, SECTOR.get(_sy, "इतर")
                         _rows.append(_r)
@@ -1705,6 +1736,9 @@ def main():
                         f"{r['symbol']} {r['direction']} ({r['score']:.0f})" for r in _top)
                         + "\n\nस्कोर = एकमत 40 + मूव्ह कमी 25 + ADX 15 + क्षेत्र-साथीदार 20. हा जिंकण्याचा अंदाज नाही; बॅकटेस्ट नाही.")
                 st.caption(f"निकाल {_res['t']:%d-%b %H:%M} · {len(_res['rows'])} पैकी {len(_show)} दाखवले")
+                _asof = sorted({r.get("asof") for r in _res["rows"] if r.get("asof")})
+                if _asof:
+                    st.caption("शेवटची candle (asof): " + ", ".join(_asof) + (" — आजची candle आलेली नाही (वगळली किंवा Dhan ने दिली नाही)" if f"{_res['t']:%d-%b}" not in _asof and _res["t"].weekday() < 5 else ""))
                 # क्षेत्र सारांश (सर्व स्कॅन केलेल्या स्टॉक्सवरून)
                 _sec = {}
                 for r in _res["rows"]:
@@ -1718,7 +1752,7 @@ def main():
                 st.markdown("**क्षेत्रानुसार झुकाव** (UP/DOWN = सर्व स्कॅन केलेल्या स्टॉक्सची दिशा, 'LATE' सहित)")
                 st.dataframe(_sd0, hide_index=True, use_container_width=True)
                 if _show:
-                    _sd = pd.DataFrame(_show).reindex(columns=["symbol", "sector", "status", "direction", "score", "why", "aligned", "adx", "move_atr", "level", "close", "note"])
+                    _sd = pd.DataFrame(_show).reindex(columns=["symbol", "sector", "status", "direction", "score", "why", "aligned", "adx", "move_atr", "level", "close", "asof", "note"])
                     st.dataframe(_sd.round(2), hide_index=True, use_container_width=True)
                     st.download_button("⬇ CSV", _sd.to_csv(index=False).encode("utf-8-sig"), "stock_scan.csv", "text/csv", key="ss_dl")
                     _ids_txt = st.text_input("Security id हाताने (पर्यायी): SYMBOL=ID, स्वल्पविराम", "", key="ss_ids",
