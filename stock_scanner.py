@@ -32,40 +32,14 @@ import samadhan_terminal as T
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-DEFAULT_STOCKS = [
-    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "LT", "ITC",
-    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "WIPRO", "HCLTECH",
-    "ADANIENT", "ADANIPORTS", "ONGC", "NTPC", "POWERGRID", "COALINDIA", "JSWSTEEL", "ULTRACEMCO",
-    "TITAN", "ASIANPAINT", "NESTLEIND", "M&M", "BAJAJFINSV", "TECHM", "INDUSINDBK", "HINDALCO",
-    "GRASIM", "DRREDDY", "CIPLA", "EICHERMOT", "BPCL", "TATACONSUM", "APOLLOHOSP", "DIVISLAB",
-    "HEROMOTOCO", "BRITANNIA", "SBILIFE",
-]
+DEFAULT_STOCKS = T.STOCK_LIST
 
 PRIORITY = {"PULLBACK READY": 0, "FRESH": 1, "LATE": 2, "WAIT": 3}
 
 
 def scan_one(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3):
-    """raw = candle DataFrame (daily). Ek stock cha nikal dict."""
-    df, _ = T.drop_forming_candle(raw, 1440, now)          # chalu (apurna) divsachi candle vagale jate
-    if df is None or len(df) < 70:
-        return {"status": "डेटा अपुरा", "direction": "-", "aligned": 0, "adx": 0.0, "move_atr": 0.0,
-                "level": None, "close": None, "note": f"candle {0 if df is None else len(df)} (किमान 70)"}
-    sig = T.monthly_hold_signal(df, window, min_aligned, min_fresh, adx_min)
-    pb = T.monthly_pullback(df, window, min_aligned, adx_min, retrace, pb_aligned)
-    adx_now = float(T.dmi(df)[2].iloc[-1])
-    close = float(df["close"].iloc[-1])
-    late = bool(pb and pb["move_atr"] > late_atr)
-    if late and pb["ready"]:
-        status, direction = "PULLBACK READY", pb["direction"]
-    elif late:
-        status, direction = "LATE", pb["direction"]
-    elif sig["direction"] in ("UP", "DOWN"):
-        status, direction = "FRESH", sig["direction"]
-    else:
-        status, direction = "WAIT", sig.get("leaning", "-")
-    return {"status": status, "direction": direction, "aligned": int(sig.get("aligned", 0)), "adx": adx_now,
-            "move_atr": float(pb["move_atr"]) if pb else 0.0, "level": float(pb["level"]) if pb else None,
-            "close": close, "note": ""}
+    """Ek stock cha nikal dict (logic terminal madhe: T.scan_stock_daily)."""
+    return T.scan_stock_daily(raw, now, window, min_aligned, min_fresh, adx_min, late_atr, retrace, pb_aligned)
 
 
 def fetch_daily(tsl, sym, exch, tf):
