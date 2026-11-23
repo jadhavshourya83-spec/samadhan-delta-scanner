@@ -592,4 +592,30 @@ assert pd_ and not pd_["reached"] and not pd_["ready"], pd_
 assert L.monthly_pullback(None) is None
 print("29d OK move nighun gela + pullback:", (round(pb_["move_atr"], 1), round(pb_["level"], 1), pb_["ready"]))
 
+# 30) stock_scanner (1 day candle) - khota Dhan (fake raw data)
+import stock_scanner as SS
+from datetime import datetime as _dt
+def _daily(closes, rng):
+    d_ = _mk(closes, rng)
+    d_["timestamp"] = pd.date_range(end="2026-11-20", periods=len(d_), freq="B")
+    return d_
+_now = _dt(2026, 11, 23, 18, 0)
+rng = np.random.default_rng(3)
+_b = list(100 + rng.normal(0, 0.6, 120))
+r_flat = SS.scan_one(_daily(_b, rng), _now, 10, 7, 5, 20.0, 1.5, 0.4, 3)
+_up = _b + list(_b[-1] + np.arange(1, 7) * 0.9 + rng.normal(0, 0.25, 6))
+r_up = SS.scan_one(_daily(_up, rng), _now, 10, 7, 5, 10.0, 1.5, 0.4, 3)      # ADX 10: sakht nasel tar FRESH yete
+r_up_adx = SS.scan_one(_daily(_up, rng), _now, 10, 7, 5, 40.0, 1.5, 0.4, 3)  # ADX 40 magitla: WAIT
+_long = _b + list(_b[-1] + np.arange(1, 40) * 0.9 + rng.normal(0, 0.25, 39))
+r_late = SS.scan_one(_daily(_long, rng), _now, 10, 7, 5, 20.0, 1.5, 0.4, 3)
+r_short = SS.scan_one(_daily(_b[:40], rng), _now)
+assert r_flat["status"] in ("WAIT", "FRESH", "LATE") and r_short["status"] == "डेटा अपुरा", (r_flat, r_short)
+assert r_up["status"] in ("FRESH", "LATE") and r_up["direction"] == "UP", r_up
+assert r_up_adx["status"] == "WAIT", r_up_adx
+assert r_late["status"] in ("LATE", "PULLBACK READY", "WAIT"), r_late
+rows_ = [dict(r_up, symbol="AAA"), dict(r_flat, symbol="BBB", status="WAIT"), dict(r_late, symbol="CCC", status="LATE")]
+fr = SS.format_rows(rows_, False)
+assert all(x["status"] != "WAIT" for x in fr) and len(SS.format_rows(rows_, True)) == 3
+print("30 OK stock scanner:", r_flat["status"], r_up["status"], r_late["status"], r_short["status"])
+
 print("\nSAGLYA CHACHNYA PASS")
