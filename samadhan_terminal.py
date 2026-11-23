@@ -919,6 +919,224 @@ def v40_plan(sig, oc, atr_u, cfg, lot_size, capital, risk_pct, step):
 
 
 # ───────── SAHMATI (sagle engine eka nirnayat) ─────────
+# ───────── Monthly HOLD engine (KST, DMI, MOM, MACD, ALMA, HMA, VI, EMA9) ─────────
+def wma(s, n):
+    w = np.arange(1, n + 1, dtype=float)
+    return s.rolling(n).apply(lambda x: float(np.dot(x, w) / w.sum()), raw=True)
+
+
+def hma(s, n=21):
+    half, sq = max(1, n // 2), max(1, int(round(n ** 0.5)))
+    return wma(2 * wma(s, half) - wma(s, n), sq)
+
+
+def alma(s, n=9, offset=0.85, sigma=6.0):
+    m, sg = offset * (n - 1), n / sigma
+    w = np.exp(-((np.arange(n) - m) ** 2) / (2 * sg * sg))
+    w = w / w.sum()
+    return s.rolling(n).apply(lambda x: float(np.dot(x, w)), raw=True)
+
+
+def macd_lines(close, fast=12, slow=26, sig=9):
+    line = ema(close, fast) - ema(close, slow)
+    return line, ema(line, sig)
+
+
+def monthly_pairs(d):
+    """Pratyek indicator = (a, b); a > b mhanje UP. 8 indicators."""
+    close = d["close"].astype(float)
+    pdi, mdi, _ = dmi(d)
+    vip, vim = vortex(d)
+    k, ks = kst(close)
+    ml, ms = macd_lines(close)
+    mom = close - close.shift(10)
+    return {"KST": (k, ks), "DMI": (pdi, mdi), "MOM": (mom, mom * 0.0), "MACD": (ml, ms),
+            "ALMA": (alma(close, 9), alma(close, 21)), "HMA": (hma(close, 9), hma(close, 21)),
+            "VI": (vip, vim), "EMA9": (close, ema(close, 9))}
+
+
+def monthly_hold_signal(d, cross_n=5, min_aligned=8, min_fresh=2, adx_min=20.0):
+    """Sarva (default 8/8) indicators ekach bajula ani kimaan `min_fresh` taaje cross gelya `cross_n` candle madhe."""
+    if d is None or len(d) < 70:
+        return {"direction": "WAIT", "checks": [], "leaning": "-", "aligned": 0, "n": 8,
+                "note": f"डेटा अपुरा (किमान 70 candle हव्यात, आहेत {0 if d is None else len(d)})"}
+    pairs = monthly_pairs(d)
+    adx_now = float(dmi(d)[2].iloc[-1])
+    res = {}
+    for direction in ("UP", "DOWN"):
+        up = direction == "UP"
+        rows, n_al, fresh = [], 0, 0
+        for name, (a, b) in pairs.items():
+            av, bv = a.iloc[-1], b.iloc[-1]
+            if pd.isna(av) or pd.isna(bv):
+                rows.append((name, False, "डेटा नाही"))
+                continue
+            al = (av > bv) if up else (av < bv)
+            bs = bars_since_cross(a, b, direction, cross_n)
+            n_al += int(al)
+            fresh += int(bs is not None)
+            rows.append((name, bool(al), "cross %d candle आधी" % bs if bs is not None else ("बाजू बरोबर" if al else "उलट बाजू")))
+        res[direction] = {"rows": rows, "aligned": n_al, "fresh": fresh,
+                          "ok": n_al >= min_aligned and fresh >= min_fresh and adx_now >= adx_min}
+    lean = "UP" if (res["UP"]["aligned"], res["UP"]["fresh"]) >= (res["DOWN"]["aligned"], res["DOWN"]["fresh"]) else "DOWN"
+    b_ = res[lean]
+    direction = lean if (b_["ok"] and not res["DOWN" if lean == "UP" else "UP"]["ok"]) else "WAIT"
+    checks = list(b_["rows"]) + [(f"cross खिडकीत ≥ {min_fresh}/8 (गेल्या {cross_n} candle)", b_["fresh"] >= min_fresh, f"{b_['fresh']}"),
+                                 (f"एकाच बाजूला ≥ {min_aligned}/8", b_["aligned"] >= min_aligned, f"{b_['aligned']}/8"),
+                                 (f"ADX ≥ {adx_min:.0f} (ट्रेंड आहे, सरळ बाजार नाही)", adx_now >= adx_min, f"{adx_now:.1f}")]
+    return {"direction": direction, "leaning": lean, "checks": checks, "aligned": b_["aligned"], "fresh": b_["fresh"], "n": 8, "note": ""}
+
+
+def monthly_align_series(d):
+    """Pratyek candle var: kiti indicators UP / DOWN bajula (a>b / a<b)."""
+    up = dn = None
+    for a, b in monthly_pairs(d).values():
+        u, w = (a > b).astype(int), (a < b).astype(int)
+        up = u if up is None else up + u
+        dn = w if dn is None else dn + w
+    return up, dn
+
+
+def monthly_pullback(d, window=75, min_aligned=8, adx_min=20.0, retrace=0.5, pb_aligned=5):
+    """Gelya `window` candle madhe sarva (>=min_aligned) indicators ekach bajula ale hote ka?
+    Asel tar: chaal kiti jhali (ATR), ani pullback pattali (peak - retrace x swing). Candle data varun, memory nako."""
+    if d is None or len(d) < 70:
+        return None
+    close, high, low = (d[c].astype(float) for c in ("close", "high", "low"))
+    up_c, dn_c = monthly_align_series(d)
+    adx = dmi(d)[2]
+    now_atr = float(atr(d).iloc[-1])
+    if not (now_atr > 0):
+        return None
+    n, best = len(d), None
+    for direction, cnt in (("UP", up_c), ("DOWN", dn_c)):
+        ok = ((cnt >= min_aligned) & (adx >= adx_min)).tolist()
+        idx = [i for i in range(max(0, n - window), n) if ok[i]]
+        if not idx:
+            continue
+        j = idx[-1]
+        s_ = j
+        while s_ - 1 >= 0 and ok[s_ - 1]:
+            s_ -= 1
+        start = float(close.iloc[s_])
+        if direction == "UP":
+            peak = float(high.iloc[s_:].max())
+            level = peak - retrace * (peak - start)
+            held = float(close.iloc[-1]) > start
+            reached = float(close.iloc[-1]) <= level
+            swing = peak - start
+        else:
+            peak = float(low.iloc[s_:].min())
+            level = peak + retrace * (start - peak)
+            held = float(close.iloc[-1]) < start
+            reached = float(close.iloc[-1]) >= level
+            swing = start - peak
+        al_now = int((up_c if direction == "UP" else dn_c).iloc[-1])
+        cand = {"direction": direction, "start": start, "peak": peak, "level": level, "move_atr": max(0.0, swing) / now_atr,
+                "bars_ago": n - 1 - j, "aligned_now": al_now, "held": held, "reached": reached,
+                "ready": bool(reached and held and al_now >= pb_aligned and swing > 0)}
+        if best is None or cand["bars_ago"] < best["bars_ago"]:
+            best = cand
+    return best
+
+
+def monthly_expiries(exp_list):
+    """Pratyek mahinyatli shevtchi expiry (monthly)."""
+    last = {}
+    for e in sorted(exp_list):
+        last[e[:7]] = e
+    return sorted(last.values())
+
+
+def pick_by_premium(oc, direction, target, spot=0.0, min_oi=1000.0, max_spread_pct=15.0):
+    """Premium `target` javalcha strike (CE=UP, PE=DOWN). Liquidity tapasto."""
+    side = "ce" if direction == "UP" else "pe"
+    smap = strike_map(oc)
+    best = None
+    for strike, node_ in smap.items():
+        node = (node_ or {}).get(side) or {}
+        ltp = _f(node.get("last_price"))
+        if ltp <= 0:
+            continue
+        cand = (abs(ltp - target) / max(target, 0.05), strike, node, ltp)
+        if best is None or cand[0] < best[0]:
+            best = cand
+    if not best:
+        return {"ok": False, "issues": ["chain मध्ये भाव असलेला strike नाही"], "side": side}
+    _, strike, node, ltp = best
+    bid, ask = _f(node.get("top_bid_price")), _f(node.get("top_ask_price"))
+    oi, vol = _f(node.get("oi")), _f(node.get("volume"))
+    delta = abs(_f((node.get("greeks") or {}).get("delta")))
+    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if (bid > 0 and ask > 0) else None
+    issues = []
+    if oi < min_oi:
+        issues.append(f"OI कमी ({oi:,.0f} < {min_oi:,.0f})")
+    if spread is not None and spread > max_spread_pct:
+        issues.append(f"bid-ask spread जास्त ({spread:.1f}%)")
+    warn = []
+    dist = abs(strike - spot) / spot * 100 if spot else None
+    if delta and delta < 0.10:
+        warn.append(f"delta फक्त {delta:.2f}: खूप लांबचा strike, लॉटरीसारखा; भाव क्वचित हलतो")
+    if abs(ltp - target) / max(target, 0.05) > 0.5:
+        warn.append(f"₹{target:g} जवळचा strike नाही (सर्वात जवळचा ₹{ltp:g})")
+    return {"ok": not issues, "issues": issues, "warn": warn, "side": side, "strike": strike, "ltp": ltp, "bid": bid,
+            "ask": ask, "oi": oi, "volume": vol, "delta": delta, "spread_pct": spread, "dist_pct": dist}
+
+
+def pick_by_delta(oc, direction, d_lo, d_hi, spot=0.0, step=50.0, min_oi=1000.0, max_spread_pct=15.0):
+    """Delta [d_lo, d_hi] madhla strike (madhyabindu javalcha). Dhan ne delta dila nasel tar andaje delta."""
+    side = "ce" if direction == "UP" else "pe"
+    smap = strike_map(oc)
+    mid, cands, est_used = (d_lo + d_hi) / 2.0, [], False
+    for strike, node_ in smap.items():
+        node = (node_ or {}).get(side) or {}
+        ltp = _f(node.get("last_price"))
+        if ltp <= 0:
+            continue
+        dl = abs(_f((node.get("greeks") or {}).get("delta")))
+        est = False
+        if dl <= 0 and spot:
+            dl, est = abs(est_delta(side, strike, spot, step)), True
+        if dl <= 0:
+            continue
+        cands.append((abs(dl - mid), strike, node, ltp, dl, est))
+    if not cands:
+        return {"ok": False, "issues": ["chain मध्ये delta/भाव असलेला strike नाही"], "side": side}
+    inside = [c for c in cands if d_lo <= c[4] <= d_hi]
+    liquid = [c for c in (inside or cands)
+              if _f(c[2].get("oi")) >= min_oi] or (inside or cands)
+    _, strike, node, ltp, delta, est = min(liquid, key=lambda c: c[0])
+    bid, ask = _f(node.get("top_bid_price")), _f(node.get("top_ask_price"))
+    oi, vol = _f(node.get("oi")), _f(node.get("volume"))
+    spread = ((ask - bid) / ((ask + bid) / 2) * 100) if (bid > 0 and ask > 0) else None
+    issues, warn = [], []
+    if oi < min_oi:
+        issues.append(f"OI कमी ({oi:,.0f} < {min_oi:,.0f})")
+    if spread is not None and spread > max_spread_pct:
+        issues.append(f"bid-ask spread जास्त ({spread:.1f}%)")
+    if not (d_lo <= delta <= d_hi):
+        warn.append(f"delta {delta:.2f} इच्छित {d_lo:g}–{d_hi:g} पट्ट्याबाहेर (सर्वात जवळचा)")
+    if est:
+        warn.append("Dhan ने delta दिला नाही; अंदाजे delta वापरला")
+    return {"ok": not issues, "issues": issues, "warn": warn, "side": side, "strike": strike, "ltp": ltp, "bid": bid, "ask": ask,
+            "oi": oi, "volume": vol, "delta": delta, "spread_pct": spread,
+            "dist_pct": (abs(strike - spot) / spot * 100) if spot else None}
+
+
+def month_plan(opt, lot_size, capital, risk_pct, sl_pct=50.0, t1_pct=100.0, t2_pct=200.0):
+    entry = opt["ask"] if opt.get("ask", 0) > 0 else opt["ltp"]
+    sl, t1, t2 = _tick(entry * (1 - sl_pct / 100)), _tick(entry * (1 + t1_pct / 100)), _tick(entry * (1 + t2_pct / 100))
+    per_lot_loss = (entry - sl) * lot_size
+    risk_amt = capital * risk_pct / 100
+    lots = int(risk_amt // per_lot_loss) if per_lot_loss > 0 else 0
+    cost = lots * lot_size * entry
+    note = ""
+    if lots < 1:
+        note = f"1 lot चा संभाव्य तोटा ₹{per_lot_loss:,.0f} तुमच्या जोखीम मर्यादेपेक्षा (₹{risk_amt:,.0f}) जास्त"
+    return {"ok": lots >= 1, "entry": _tick(entry), "sl": sl, "t1": t1, "t2": t2, "lots": lots, "qty": lots * lot_size,
+            "max_loss": lots * per_lot_loss, "cost": cost, "note": note}
+
+
 def chart_vote(sig):
     """Chart: purn signal = vote. Ekhadich ati kami asel (<=1 apayshi) tar jhukav vote."""
     if sig.get("direction") in ("UP", "DOWN"):
@@ -1140,6 +1358,33 @@ def main():
         run_cont = st.checkbox("🔁 Trend continuation / pullback (प्रायोगिक)", True,
                                help="ताजा cross नसलेल्या मजबूत ट्रेंडमध्ये EMA9 पर्यंत परत येऊन पुन्हा पुढे जाताना चार्टचे मत. एकटा entry देत नाही; सहमतीत एक मत म्हणून आणि tracker मध्ये नोंदला जातो.")
         run_v34_on = st.checkbox("V34 इंजिन (तुमचा कोड) चालवा (SENSEX / NIFTY)", False)
+        run_month = st.checkbox("📅 Monthly HOLD इंजिन (प्रायोगिक)", False,
+                                help="महिन्याच्या expiry चा वेगळा तारीख निवडा. KST, DMI, MOM, MACD, ALMA, HMA, VI, EMA9 सर्व एकाच बाजूला आले की entry आणि Telegram. "
+                                     "Journal/सहमतीत मिसळत नाही; फक्त Signal tracker मध्ये 'MONTHLY HOLD' म्हणून नोंद.")
+        with st.expander("📅 Monthly HOLD सेटिंग्ज"):
+            m_mode = st.selectbox("Strike कसा निवडायचा", ["Delta वर (होल्ड करायला सोपे)", "Premium वर (₹ जवळचा)"], 0,
+                                  help="Delta 0.3–0.5 = ATM च्या जवळ; index हलला की premium बऱ्यापैकी हलतो आणि शून्य होण्याची शक्यता कमी. "
+                                       "Premium ₹10 सारखा स्वस्त strike खूप लांबचा असतो (लॉटरीसारखा).")
+            m_dlo, m_dhi = st.slider("Delta पट्टा (Delta वर निवडल्यास)", 0.10, 0.90, (0.30, 0.50), 0.05)
+            m_target = st.number_input("लक्ष्य premium ₹ (फक्त Premium वर निवडल्यास)", 1.0, 2000.0, 10.0, 1.0,
+                                       help="₹10 चा monthly strike खूप लांबचा (OTM) असतो; भाव क्वचित हलतो आणि नंतर शून्य होऊ शकतो. ITM/ATM हवा असेल तर ही रक्कम वाढवा.")
+            m_min_al = st.slider("किमान किती इंडिकेटर एकाच बाजूला (8 = सर्व)", 4, 8, 8)
+            m_fresh = st.slider("किमान किती इंडिकेटरचा cross खिडकीत झालेला (8 = सर्व)", 0, 8, 8)
+            m_adx = st.slider("ADX किमान (सरळ बाजार टाळण्यासाठी)", 10, 40, 20)
+            m_cross_n = st.slider("cross ची खिडकी: गेल्या किती candle", 2, 400, 75,
+                                  help="5 मिनिटांच्या candle वर 75 candle = सुमारे 1 ट्रेडिंग दिवस. एखादा इंडिकेटर आदल्या दिवशी आणि बाकीचे नंतर आले तरी चालते; "
+                                       "फक्त आत्ता सर्व एकाच बाजूला आणि प्रत्येकाचा cross खिडकीत हवा. 15 मिनिटांच्या candle वर 25 = 1 दिवस.")
+            m_sl, m_t1, m_t2 = (st.number_input("SL % (premium)", 10.0, 90.0, 50.0, 5.0),
+                                st.number_input("T1 % (अर्धे विका)", 20.0, 500.0, 100.0, 10.0),
+                                st.number_input("T2 %", 50.0, 1000.0, 200.0, 10.0))
+            m_late = st.slider("मूव्ह इतके ATR झाला की 'निघून गेला' (strike दाखवू नका)", 0.5, 5.0, 1.5, 0.25,
+                               help="सर्व इंडिकेटर जुळल्यापासून भाव इतक्या ATR पेक्षा जास्त हलला असेल तर नवी entry/strike दाखवत नाही; फक्त pullback ची वाट पाहतो.")
+            m_retr = st.slider("Pullback किती % (मूव्हच्या)", 15, 75, 40, 5,
+                               help="मूव्हच्या टोकापासून तेवढा % परत आला की pullback entry. 38–50% सामान्य मानतात (तपासलेले नाही).")
+            m_pb_al = st.slider("Pullback वेळी किमान किती इंडिकेटर अजून एकाच बाजूला", 2, 8, 3,
+                                help="Pullback मध्ये MOM, EMA9, HMA असे वेगवान इंडिकेटर आधी उलटतात; म्हणून इथे सर्व 8 मागू नका.")
+            m_oi = st.number_input("किमान OI (strike वर)", 0.0, 1e7, 1000.0, 500.0)
+            m_spread = st.slider("कमाल bid-ask spread %", 3, 40, 15)
         tf_min = int(st.selectbox("⏱ Candle (मिनिटे)", [5, 3, 1], 0,
                                   help="लहान candle = सिग्नल लवकर पण जास्त खोटे. 3 किंवा 1 मिनिट Dhan/Tradehull ने समर्थित असावे (तपासलेले नाही). "
                                        "चुकले तर 'Candle डेटा त्रुटी' दिसेल; 5 वर परत या."))
@@ -1632,6 +1877,77 @@ def main():
                         SIGLOG.write_text(json.dumps(SL_))
                     except Exception:
                         pass
+
+        # ───────── Monthly HOLD (वेगळा expiry, वेगळे इंडिकेटर; सहमतीत मिसळत नाही) ─────────
+        if run_month:
+            st.divider()
+            with st.expander("📅 Monthly HOLD इंजिन", expanded=True):
+                m_list = monthly_expiries(exp_list) or exp_list
+                if not m_list:
+                    st.info("Expiry यादी मिळाली नाही.")
+                else:
+                    m_exp = st.selectbox("Monthly expiry (वेगळी तारीख)", m_list, 0, key=f"mexp_{sym}")
+                    msig = monthly_hold_signal(df, m_cross_n, m_min_al, m_fresh, float(m_adx))
+                    st.caption(f"{sym} · candle {tf_min} मिनिटे · झुकाव {msig['leaning']} · {msig['aligned']}/8 एकाच बाजूला · ताजे cross {msig.get('fresh', 0)}")
+                    if msig.get("note"):
+                        st.info(msig["note"])
+                    if msig["checks"]:
+                        st.dataframe(pd.DataFrame([{"": "✅" if ok_ else "❌", "इंडिकेटर / अट": n_, "आत्ता": d_} for n_, ok_, d_ in msig["checks"]]),
+                                     hide_index=True, use_container_width=True)
+                    pb = monthly_pullback(df, m_cross_n, m_min_al, float(m_adx), m_retr / 100.0, m_pb_al)
+                    m_late_flag = bool(pb and pb["move_atr"] > m_late)
+                    entry_dir, entry_kind = None, None
+                    if msig["direction"] in ("UP", "DOWN") and not m_late_flag:
+                        entry_dir, entry_kind = msig["direction"], "FRESH"
+                    elif m_late_flag and pb["ready"]:
+                        entry_dir, entry_kind = pb["direction"], "PULLBACK"
+                    if m_late_flag:
+                        arrow = "↑" if pb["direction"] == "UP" else "↓"
+                        st.warning(f"⏭ मूव्ह निघून गेला ({pb['direction']} {arrow}, {pb['move_atr']:.1f} ATR, {pb['bars_ago']} candle आधी सर्व इंडिकेटर जुळले होते). "
+                                   f"नवी entry/strike दाखवत नाही. Pullback पातळी: spot **{pb['level']:,.1f}** "
+                                   f"({m_retr}% परत). आत्ता spot {spot:,.1f}, {pb['aligned_now']}/8 इंडिकेटर अजून एकाच बाजूला. "
+                                   + ("✅ pullback आला आहे, खाली entry दिसेल." if pb["ready"] else
+                                      ("⚠ भाव मूव्हच्या सुरुवातीच्या पातळीच्या आत गेला (setup बिघडला)." if not pb["held"] else "⏳ pullback ची वाट पाहा.")))
+                    if entry_dir:
+                        try:
+                            mch = cached(f"c_{sym}_{m_exp}", 20, lambda: fetch_chain(d_api, meta["id"], m_exp))
+                            mopt = (pick_by_delta(mch["oc"], entry_dir, float(m_dlo), float(m_dhi), spot, meta["step"], float(m_oi), float(m_spread))
+                                    if m_mode.startswith("Delta") else
+                                    pick_by_premium(mch["oc"], entry_dir, float(m_target), spot, float(m_oi), float(m_spread)))
+                        except Exception as e_:
+                            mopt = None
+                            st.error(f"Monthly option chain त्रुटी: {e_}")
+                        if mopt:
+                            mp = month_plan(mopt, int(lot_size), float(capital), float(risk_pct), float(m_sl), float(m_t1), float(m_t2))
+                            kind = "CALL (CE)" if entry_dir == "UP" else "PUT (PE)"
+                            for w_ in mopt.get("warn", []):
+                                st.warning("⚠ " + w_)
+                            for i_ in mopt.get("issues", []):
+                                st.warning("Option: " + i_)
+                            if mp["ok"] and mopt["ok"]:
+                                st.success(f"📅 MONTHLY ENTRY ({entry_kind}): {sym} {mopt['strike']:.0f} {kind} · expiry {m_exp} · Entry ~₹{mp['entry']} · "
+                                           f"SL ₹{mp['sl']} · T1 ₹{mp['t1']} (अर्धे विका) · T2 ₹{mp['t2']} · {mp['lots']} lot · "
+                                           f"कमाल तोटा ₹{mp['max_loss']:.0f}")
+                                _mk = f"month_tg_{sym}_{msig['direction']}"
+                                if (in_trade_window(now, cfg.window_start, cfg.window_end)
+                                        and now_ts - st.session_state.get(_mk, 0) > 60 * 60):
+                                    st.session_state[_mk] = now_ts
+                                    _ok = send_telegram(f"📅 MONTHLY {entry_kind} · {sym} {mopt['strike']:.0f} {kind} (expiry {m_exp})\n"
+                                                        f"Entry ~₹{mp['entry']} · SL ₹{mp['sl']} · T1 ₹{mp['t1']} · T2 ₹{mp['t2']} · {mp['lots']} lot · "
+                                                        f"कमाल तोटा ₹{mp['max_loss']:.0f}\nSpot {spot:,.1f} · {now:%H:%M}\n"
+                                                        f"{msig['aligned']}/8 इंडिकेटर एकमत. फक्त माहिती; order आपोआप जात नाही. सल्ला नाही.")
+                                    st.toast("Monthly Telegram: " + ("पाठवला" if _ok else "पाठवला नाही (secrets तपासा)"))
+                                    siglog_add(SL_, now_ts, sym, m_exp, f"MONTHLY {entry_kind}", entry_dir, mopt["strike"], mopt["side"],
+                                               spot, float(msig["aligned"]), _exp_day)
+                                    try:
+                                        SIGLOG.write_text(json.dumps(SL_))
+                                    except Exception:
+                                        pass
+                            else:
+                                st.info("सिग्नल आहे, पण entry योजना नाही: " + (mp["note"] or "option अटी अपूर्ण"))
+                    elif not m_late_flag:
+                        st.caption("सर्व अटी जुळल्यावरच entry दिसेल. आठही एकत्र जुळणे दुर्मिळ आहे; हवे तर सेटिंगमध्ये 7/8 किंवा 6/8 करा.")
+                    st.caption("प्रायोगिक; backtest नाही. ₹10 चा monthly strike खूप लांबचा असतो, तो शून्यही होऊ शकतो. आर्थिक सल्ला नाही.")
 
         # ───────── सहमती: चार्ट + OI flow + CAS + V40 (+V34) ─────────
         v40_vs = st.session_state.get("v40_last_signal") if run_v40_on else None
