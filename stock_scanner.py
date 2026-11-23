@@ -37,9 +37,9 @@ DEFAULT_STOCKS = T.STOCK_LIST
 PRIORITY = {"FORMING": 0, "FRESH": 1, "PULLBACK READY": 2, "LATE": 3, "WAIT": 4}
 
 
-def scan_one(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.0, retrace=0.4, pb_aligned=3, form_aligned=5, form_adx=15.0):
+def scan_one(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.0, retrace=0.4, pb_aligned=3, form_aligned=5, form_adx=15.0, live=False):
     """Ek stock cha nikal dict (logic terminal madhe: T.scan_stock_daily)."""
-    return T.scan_stock_daily(raw, now, window, min_aligned, min_fresh, adx_min, late_atr, retrace, pb_aligned, form_aligned, form_adx)
+    return T.scan_stock_daily(raw, now, window, min_aligned, min_fresh, adx_min, late_atr, retrace, pb_aligned, form_aligned, form_adx, live)
 
 
 def fetch_daily(tsl, sym, exch, tf):
@@ -78,6 +78,7 @@ def main():
     ap.add_argument("--delay", type=float, default=1.0, help="don mangnyanmadhe sekand (Dhan limit sathi; limit mahit nahi)")
     ap.add_argument("--all", action="store_true", help="LATE/PULLBACK/WAIT sahit sarva dakhav")
     ap.add_argument("--telegram", action="store_true")
+    ap.add_argument("--live", action="store_true", help="aajchi chalu daily candle dhara (bajar chalu astana)")
     ap.add_argument("--out", default="stock_scan.csv")
     a = ap.parse_args()
 
@@ -99,7 +100,7 @@ def main():
     for i, sym in enumerate(syms, 1):
         try:
             raw = fetch_daily(tsl, sym, a.exch, a.tf)
-            r = scan_one(raw, now, a.window, a.min_aligned, a.min_fresh, a.adx, a.late_atr, a.retrace, a.pb_aligned)
+            r = scan_one(raw, now, a.window, a.min_aligned, a.min_fresh, a.adx, a.late_atr, a.retrace, a.pb_aligned, 5, 15.0, a.live)
             r["symbol"], r["sector"] = sym, T.SECTOR.get(sym, "इतर")
             rows.append(r)
         except Exception as e:
