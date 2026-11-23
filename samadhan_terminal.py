@@ -1092,6 +1092,22 @@ def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20
             "move_atr": move, "level": level, "close": float(df["close"].iloc[-1]), "note": ""}
 
 
+def stock_rank(rows, late_atr=1.0):
+    """FRESH/FORMING stocks na 0-100 score. Sanket kiti 'saaf' ahe te; stock jinkel ase sangat nahi (backtest nahi).
+    40: kiti indicators ekmat (/8)  25: move kiti kami (ATR)  15: ADX (trend takad, 40 paryant)  20: tya kshetratle itar stocks tyach dishela (3 paryant)."""
+    for r in rows:
+        r["score"], r["why"] = None, ""
+    for r in rows:
+        if r.get("status") not in ("FORMING", "FRESH"):
+            continue
+        same = min(3, sum(1 for o in rows if o is not r and o.get("sector") == r.get("sector") and o.get("direction") == r.get("direction")
+                          and o.get("status") in ("FORMING", "FRESH", "PULLBACK READY", "LATE")))
+        sc = r["aligned"] / 8.0 * 40 + max(0.0, 1 - r["move_atr"] / max(late_atr, 0.1)) * 25 + min(r["adx"], 40.0) / 40.0 * 15 + same / 3.0 * 20
+        r["score"] = round(sc, 1)
+        r["why"] = f"{r['aligned']}/8 · मूव्ह {r['move_atr']:.2f} ATR · ADX {r['adx']:.0f} · क्षेत्रात साथीदार {same}"
+    return rows
+
+
 def _ci_col(df, *needles):
     for c in df.columns:
         u = str(c).upper()
@@ -1661,7 +1677,13 @@ def main():
                 _pr = {"FORMING": 0, "FRESH": 1, "PULLBACK READY": 2, "LATE": 3, "WAIT": 4}
                 _early = ("FORMING", "FRESH")
                 _show = [r for r in _res["rows"] if r["status"] in _early or (_sm and r["status"] in ("PULLBACK READY", "LATE")) or _sall]
-                _show.sort(key=lambda r: (_pr.get(r["status"], 9), r.get("sector", ""), -r["aligned"], -r["adx"]))
+                stock_rank(_res["rows"], float(_sl))
+                _show.sort(key=lambda r: (_pr.get(r["status"], 9), -(r.get("score") or 0), r.get("sector", ""), -r["aligned"]))
+                _top = [r for r in _show if r.get("score") is not None][:3]
+                if _top:
+                    st.success("⭐ **TOP " + str(len(_top)) + " (सर्वात साफ सेटअप):** " + " · ".join(
+                        f"{r['symbol']} {r['direction']} ({r['score']:.0f})" for r in _top)
+                        + "\n\nस्कोर = एकमत 40 + मूव्ह कमी 25 + ADX 15 + क्षेत्र-साथीदार 20. हा जिंकण्याचा अंदाज नाही; बॅकटेस्ट नाही.")
                 st.caption(f"निकाल {_res['t']:%d-%b %H:%M} · {len(_res['rows'])} पैकी {len(_show)} दाखवले")
                 # क्षेत्र सारांश (सर्व स्कॅन केलेल्या स्टॉक्सवरून)
                 _sec = {}
@@ -1676,7 +1698,7 @@ def main():
                 st.markdown("**क्षेत्रानुसार झुकाव** (UP/DOWN = सर्व स्कॅन केलेल्या स्टॉक्सची दिशा, 'LATE' सहित)")
                 st.dataframe(_sd0, hide_index=True, use_container_width=True)
                 if _show:
-                    _sd = pd.DataFrame(_show).reindex(columns=["symbol", "sector", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"])
+                    _sd = pd.DataFrame(_show).reindex(columns=["symbol", "sector", "status", "direction", "score", "why", "aligned", "adx", "move_atr", "level", "close", "note"])
                     st.dataframe(_sd.round(2), hide_index=True, use_container_width=True)
                     st.download_button("⬇ CSV", _sd.to_csv(index=False).encode("utf-8-sig"), "stock_scan.csv", "text/csv", key="ss_dl")
                     _ids_txt = st.text_input("Security id हाताने (पर्यायी): SYMBOL=ID, स्वल्पविराम", "", key="ss_ids",
