@@ -1656,6 +1656,8 @@ def main():
                 st.session_state.pop("stock_strikes", None)
             _res = st.session_state.get("stock_scan")
             if _res:
+                for r in _res["rows"]:
+                    r.setdefault("sector", SECTOR.get(r.get("symbol", ""), "इतर"))
                 _pr = {"FORMING": 0, "FRESH": 1, "PULLBACK READY": 2, "LATE": 3, "WAIT": 4}
                 _early = ("FORMING", "FRESH")
                 _show = [r for r in _res["rows"] if r["status"] in _early or (_sm and r["status"] in ("PULLBACK READY", "LATE")) or _sall]
@@ -1674,7 +1676,7 @@ def main():
                 st.markdown("**क्षेत्रानुसार झुकाव** (UP/DOWN = सर्व स्कॅन केलेल्या स्टॉक्सची दिशा, 'LATE' सहित)")
                 st.dataframe(_sd0, hide_index=True, use_container_width=True)
                 if _show:
-                    _sd = pd.DataFrame(_show)[["symbol", "sector", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]]
+                    _sd = pd.DataFrame(_show).reindex(columns=["symbol", "sector", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"])
                     st.dataframe(_sd.round(2), hide_index=True, use_container_width=True)
                     st.download_button("⬇ CSV", _sd.to_csv(index=False).encode("utf-8-sig"), "stock_scan.csv", "text/csv", key="ss_dl")
                     _ids_txt = st.text_input("Security id हाताने (पर्यायी): SYMBOL=ID, स्वल्पविराम", "", key="ss_ids",
