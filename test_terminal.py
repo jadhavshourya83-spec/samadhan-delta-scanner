@@ -505,4 +505,91 @@ assert flats <= 3, flats                          # sideways madhe kvachit (<~7%
 assert L.continuation_signal(None, L.Cfg())["direction"] is None
 print(f"28 OK trend continuation (synthetic: UP {ups}/40, DOWN {dns}/40, sideways false {flats}/40)")
 
+# 29) Monthly HOLD: indicators, monthly expiry, ₹10 strike, plan
+exps = ["2026-11-23", "2026-11-25", "2026-11-30", "2026-12-01", "2026-12-08", "2026-12-29", "2027-01-26"]
+assert L.monthly_expiries(exps) == ["2026-11-30", "2026-12-29", "2027-01-26"], L.monthly_expiries(exps)
+_rng = np.random.default_rng(5)
+_s = pd.Series(100 + np.arange(120) * 0.3 + _rng.normal(0, 0.5, 120))
+assert _s.shape == L.hma(_s, 21).shape and L.hma(_s, 21).iloc[-1] > L.hma(_s, 21).iloc[-20]       # HMA vadhto
+assert abs(L.alma(_s, 9).iloc[-1] - _s.iloc[-1]) < 3                                              # ALMA kimmat javal
+_ml, _ms = L.macd_lines(_s); assert _ml.iloc[-1] > 0
+assert L.monthly_hold_signal(None)["direction"] == "WAIT" and L.monthly_hold_signal(None)["note"]
+ok_up = ok_dn = fl = 0
+for seed in range(40):
+    rng = np.random.default_rng(seed)
+    base = list(100 + rng.normal(0, 0.6, 90))                                                   # sideways, mag zep
+    up = base + list(base[-1] + np.arange(1, 6) * 0.9 + rng.normal(0, 0.25, 5))
+    dn = base + list(base[-1] - np.arange(1, 6) * 0.9 + rng.normal(0, 0.25, 5))
+    ok_up += L.monthly_hold_signal(_mk(up, rng), 5, 7, 1)["direction"] == "UP"
+    ok_dn += L.monthly_hold_signal(_mk(dn, rng), 5, 7, 1)["direction"] == "DOWN"
+    fl += L.monthly_hold_signal(_mk(list(100 + rng.normal(0, 0.6, 110)), rng), 5, 8, 2)["direction"] != "WAIT"
+assert ok_up >= 10 and ok_dn >= 10, (ok_up, ok_dn)
+assert fl <= 4, fl                                                                               # sideways + sakht niyam = kvachit
+oc29 = {"23000.000000": {"ce": {"last_price": 10.4, "top_bid_price": 10.0, "top_ask_price": 10.8, "oi": 8000, "greeks": {"delta": 0.05}},
+                         "pe": {"last_price": 300.0, "top_bid_price": 299, "top_ask_price": 301, "oi": 9000, "greeks": {"delta": -0.6}}},
+        "22000.000000": {"ce": {"last_price": 1100.0, "top_bid_price": 1099, "top_ask_price": 1101, "oi": 9000, "greeks": {"delta": 0.9}},
+                         "pe": {"last_price": 9.9, "top_bid_price": 9.5, "top_ask_price": 10.3, "oi": 7000, "greeks": {"delta": -0.04}}}}
+o29 = L.pick_by_premium(oc29, "UP", 10.0, 22500.0)
+assert o29["strike"] == 23000 and o29["side"] == "ce" and o29["ok"] and o29["warn"], o29      # delta kami = lotery chetavni
+o29p = L.pick_by_premium(oc29, "DOWN", 10.0, 22500.0)
+assert o29p["strike"] == 22000 and o29p["side"] == "pe"
+o29b = L.pick_by_premium(oc29, "UP", 10.0, 22500.0, min_oi=50000)
+assert not o29b["ok"] and o29b["issues"]
+pl29 = L.month_plan(o29, 65, 100000, 1.0, 50, 100, 200)
+assert pl29["ok"] and pl29["sl"] < pl29["entry"] < pl29["t1"] < pl29["t2"] and pl29["max_loss"] <= 1000 + 1e-6, pl29
+pl29s = L.month_plan(o29, 65, 10000, 1.0, 50, 100, 200)                                          # 10k bhandval, 1% jokhim = 100 -> 1 lot (~Rs 340 tota) basat nahi
+assert not pl29s["ok"] and pl29s["note"]
+print(f"29 OK monthly HOLD (UP {ok_up}/40, DOWN {ok_dn}/40, sideways khote {fl}/40)")
+
+# 29b) khidki: ek divas (75 candle) — kahi indicators aadhi, kahi nantar cross zale tari chalel; khup junya trend var nahi
+_c = L.monthly_hold_signal
+res_ = {}
+for n_ in (12, 30, 60, 160):
+    hit = 0
+    for seed in range(30):
+        rng = np.random.default_rng(seed)
+        base = list(100 + rng.normal(0, 0.6, 90))
+        up = base + list(base[-1] + np.arange(1, n_ + 1) * 0.5 + rng.normal(0, 0.25, n_))
+        hit += _c(_mk(up, rng), 75, 8, 8, 20.0)["direction"] == "UP"
+    res_[n_] = hit
+assert res_[12] >= 5 and res_[30] >= 5, res_            # divsabhar chalel
+assert res_[160] <= res_[30], res_                      # junya (2 divsa purvichya) trend var kami
+print("29b OK ek divas khidki:", res_)
+
+# 29c) delta var strike
+oc29d = {"22000.000000": {"ce": {"last_price": 560.0, "top_bid_price": 559, "top_ask_price": 561, "oi": 9000, "greeks": {"delta": 0.85}}},
+         "22400.000000": {"ce": {"last_price": 230.0, "top_bid_price": 229, "top_ask_price": 231, "oi": 9000, "greeks": {"delta": 0.55}}},
+         "22500.000000": {"ce": {"last_price": 170.0, "top_bid_price": 169, "top_ask_price": 171, "oi": 9000, "greeks": {"delta": 0.45}}},
+         "22700.000000": {"ce": {"last_price": 90.0, "top_bid_price": 89, "top_ask_price": 91, "oi": 9000, "greeks": {"delta": 0.31}}},
+         "23500.000000": {"ce": {"last_price": 9.0, "top_bid_price": 8.5, "top_ask_price": 9.5, "oi": 9000, "greeks": {"delta": 0.04}}},
+         "22300.000000": {"pe": {"last_price": 80.0, "top_bid_price": 79, "top_ask_price": 81, "oi": 9000, "greeks": {"delta": -0.4}}}}
+od = L.pick_by_delta(oc29d, "UP", 0.30, 0.50, 22450.0, 100.0)
+assert od["strike"] == 22500 and od["ok"] and not od["warn"], od                    # 0.45 = madhyabindu (0.40) javal
+od2 = L.pick_by_delta(oc29d, "UP", 0.60, 0.70, 22450.0, 100.0)                      # pattyat konihi nahi -> javalcha + chetavni
+assert od2["strike"] in (22400, 22500) and od2["warn"], od2
+oc_ng = {k: {s_: {kk: vv for kk, vv in v_.items() if kk != "greeks"} for s_, v_ in n_.items()} for k, n_ in oc29d.items()}
+od3 = L.pick_by_delta(oc_ng, "UP", 0.30, 0.50, 22450.0, 100.0)                       # delta nasel tar andaje, chetavni
+assert od3["ok"] and any("अंदाजे" in w for w in od3["warn"]), od3
+assert L.pick_by_delta({}, "UP", 0.3, 0.5, 100.0)["ok"] is False
+print("29c OK delta var strike:", od["strike"], od["delta"], od["ltp"])
+
+# 29d) move nighun gela + pullback
+def _run(n_up, n_pull, retr, pb_al, step=0.5):
+    rng = np.random.default_rng(11)
+    base = list(100 + rng.normal(0, 0.6, 90))
+    up = base + list(base[-1] + np.arange(1, n_up + 1) * 0.7 + rng.normal(0, 0.2, n_up))
+    pk = up[-1]
+    up += list(pk - np.arange(1, n_pull + 1) * step + rng.normal(0, 0.2, n_pull))
+    return L.monthly_pullback(_mk(up, rng), 75, 7, 20.0, retr, pb_al)
+pa = _run(30, 0, 0.15, 2)                    # peak var, pullback nahi
+pb_ = _run(30, 8, 0.15, 2)                   # 15% pullback pattala, 2+ indicators ajun UP
+pc = _run(30, 8, 0.15, 5)                    # pan fakt 2 ajun UP -> 5 mhanje 'ready' nahi
+pd_ = _run(30, 4, 0.5, 2)                    # 50% pullback ajun ala nahi
+assert pa and pa["direction"] == "UP" and pa["move_atr"] > 1.5 and not pa["ready"], pa
+assert pb_ and pb_["ready"] and pb_["level"] < pb_["peak"], pb_
+assert pc and not pc["ready"], pc
+assert pd_ and not pd_["reached"] and not pd_["ready"], pd_
+assert L.monthly_pullback(None) is None
+print("29d OK move nighun gela + pullback:", (round(pb_["move_atr"], 1), round(pb_["level"], 1), pb_["ready"]))
+
 print("\nSAGLYA CHACHNYA PASS")
