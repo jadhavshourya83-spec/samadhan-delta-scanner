@@ -618,4 +618,40 @@ fr = SS.format_rows(rows_, False)
 assert all(x["status"] != "WAIT" for x in fr) and len(SS.format_rows(rows_, True)) == 3
 print("30 OK stock scanner:", r_flat["status"], r_up["status"], r_late["status"], r_short["status"])
 
+# 31) FORMING (tayar hot ahe) + sector + stock strike (khote d_api / tsl)
+assert L.SECTOR["TCS"] == "IT" and all(x in L.SECTOR for x in L.STOCK_LIST), [x for x in L.STOCK_LIST if x not in L.SECTOR]
+form = nonform = 0
+for seed in range(30):
+    rng = np.random.default_rng(seed)
+    base = list(100 + rng.normal(0, 0.6, 120))
+    up = base + list(base[-1] + np.arange(1, 4) * 0.7 + rng.normal(0, 0.25, 3))
+    r1 = L.scan_stock_daily(_daily(up, rng), _now, 10, 8, 8, 20.0, 1.0, 0.4, 3, 5, 10.0)
+    form += r1["status"] in ("FORMING", "FRESH") and r1["direction"] == "UP"
+    r2 = L.scan_stock_daily(_daily(_b[:119] + [100.0], rng), _now, 10, 8, 8, 20.0, 1.0, 0.4, 3, 5, 15.0)
+assert form >= 5, form
+rng = np.random.default_rng(3)
+rl = L.scan_stock_daily(_daily(_long, rng), _now, 10, 7, 5, 20.0, 1.0, 0.4, 3, 5, 15.0)
+assert rl["status"] not in ("FORMING", "FRESH"), rl                  # moth moves nighun geleli: kami move wali list madhe nahi
+
+class _FakeAPI:
+    def expiry_list(self, under_security_id, under_exchange_segment):
+        assert under_exchange_segment == "NSE_EQ"
+        return {"data": ["2026-11-24", "2026-12-29", "2027-01-26"]}
+    def option_chain(self, under_security_id, under_exchange_segment, expiry):
+        return {"data": {"data": {"last_price": 2400.0, "oc": {
+            "2400.000000": {"ce": {"last_price": 95.0, "top_bid_price": 94, "top_ask_price": 96, "oi": 5000, "greeks": {"delta": 0.52}},
+                            "pe": {"last_price": 90.0, "top_bid_price": 89, "top_ask_price": 91, "oi": 5000, "greeks": {"delta": -0.48}}},
+            "2500.000000": {"ce": {"last_price": 45.0, "top_bid_price": 44, "top_ask_price": 46, "oi": 5000, "greeks": {"delta": 0.3}},
+                            "pe": {"last_price": 160.0, "top_bid_price": 159, "top_ask_price": 161, "oi": 5000, "greeks": {"delta": -0.7}}}}}}}
+class _FakeTSL:
+    instrument_df = pd.DataFrame({"SEM_SMST_SECURITY_ID": [11536, 999], "SEM_TRADING_SYMBOL": ["TCS", "TCS-Dec2026-2400-CE"],
+                                  "SEM_INSTRUMENT_NAME": ["EQUITY", "OPTSTK"], "SEM_EXM_EXCH_ID": ["NSE", "NSE"], "SEM_LOT_UNITS": [1, 175]})
+assert L.stock_security_id(_FakeTSL(), "TCS") == 11536 and L.stock_security_id(_FakeTSL(), "XYZ") is None
+assert L.stock_security_id(_FakeTSL(), "XYZ", {"XYZ": 5}) == 5
+sp = L.stock_strike_pick(_FakeAPI(), _FakeTSL(), "TCS", "UP", _now, 0.3, 0.5, 1000, 15)
+assert sp["expiry"] == "2026-12-29" and sp["strike"] in (2400, 2500) and sp["side"] == "CE" and sp["lot"] == 175 and sp["cost"], sp
+sp2 = L.stock_strike_pick(_FakeAPI(), type("T", (), {})(), "ZZZ", "UP", _now, 0.3, 0.5, 1000, 15)
+assert "err" in sp2
+print("31 OK FORMING/sector/stock strike:", form, sp["strike"], sp["expiry"], sp["lot"])
+
 print("\nSAGLYA CHACHNYA PASS")
