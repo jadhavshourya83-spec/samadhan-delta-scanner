@@ -1369,6 +1369,9 @@ def main():
             m_target = st.number_input("लक्ष्य premium ₹ (फक्त Premium वर निवडल्यास)", 1.0, 2000.0, 10.0, 1.0,
                                        help="₹10 चा monthly strike खूप लांबचा (OTM) असतो; भाव क्वचित हलतो आणि नंतर शून्य होऊ शकतो. ITM/ATM हवा असेल तर ही रक्कम वाढवा.")
             m_min_al = st.slider("किमान किती इंडिकेटर एकाच बाजूला (8 = सर्व)", 4, 8, 8)
+            m_tf = st.selectbox("Monthly साठी candle", ["चार्टचाच (वर निवडलेला)", "15 मिनिट", "60 मिनिट", "1 DAY"], 0,
+                                help="1 DAY निवडल्यास इंडिकेटर रोजच्या candle वर चालतात (किमान 70 दिवसांचा डेटा लागतो). तेव्हा खिडकी आपोआप 10 दिवस, "
+                                     "15 मिनिट = 25 candle (1 दिवस), 60 मिनिट = 6 candle. Tradehull ने हे timeframe दिले की नाही तपासलेले नाही; त्रुटी दिसली तर कळवा.")
             m_fresh = st.slider("किमान किती इंडिकेटरचा cross खिडकीत झालेला (8 = सर्व)", 0, 8, 8)
             m_adx = st.slider("ADX किमान (सरळ बाजार टाळण्यासाठी)", 10, 40, 20)
             m_cross_n = st.slider("cross ची खिडकी: गेल्या किती candle", 2, 400, 75,
@@ -1887,14 +1890,26 @@ def main():
                     st.info("Expiry यादी मिळाली नाही.")
                 else:
                     m_exp = st.selectbox("Monthly expiry (वेगळी तारीख)", m_list, 0, key=f"mexp_{sym}")
-                    msig = monthly_hold_signal(df, m_cross_n, m_min_al, m_fresh, float(m_adx))
-                    st.caption(f"{sym} · candle {tf_min} मिनिटे · झुकाव {msig['leaning']} · {msig['aligned']}/8 एकाच बाजूला · ताजे cross {msig.get('fresh', 0)}")
+                    _tfmap = {"15 मिनिट": ("15", 15, 25), "60 मिनिट": ("60", 60, 6), "1 DAY": ("DAY", 1440, 10)}
+                    mdf, mwin, m_tf_txt = df, m_cross_n, f"{tf_min} मिनिटे"
+                    if m_tf in _tfmap:
+                        _code, _min, mwin = _tfmap[m_tf]
+                        try:
+                            _raw = cached(f"hm_{sym}_{_code}", 120, lambda: tsl.get_historical_data(meta["csym"], meta["cexch"], _code))
+                            mdf, _n = drop_forming_candle(_raw, _min, now)
+                            m_tf_txt = m_tf
+                        except Exception as e_:
+                            st.error(f"Monthly candle ({m_tf}) डेटा त्रुटी: {e_}. चार्टचाच candle वापरतो आहे.")
+                            mdf, mwin, m_tf_txt = df, m_cross_n, f"{tf_min} मिनिटे (म्हणजे {m_tf} मिळाले नाही)"
+                    msig = monthly_hold_signal(mdf, mwin, m_min_al, m_fresh, float(m_adx))
+                    st.caption(f"{sym} · candle {m_tf_txt} · खिडकी {mwin} · झुकाव {msig['leaning']} · {msig['aligned']}/8 एकाच बाजूला · ताजे cross {msig.get('fresh', 0)}")
                     if msig.get("note"):
                         st.info(msig["note"])
                     if msig["checks"]:
                         st.dataframe(pd.DataFrame([{"": "✅" if ok_ else "❌", "इंडिकेटर / अट": n_, "आत्ता": d_} for n_, ok_, d_ in msig["checks"]]),
                                      hide_index=True, use_container_width=True)
-                    pb = monthly_pullback(df, m_cross_n, m_min_al, float(m_adx), m_retr / 100.0, m_pb_al)
+                    m_strike_txt, m_reason = "—", "सर्व अटी जुळल्या नाहीत (WAIT)"
+                    pb = monthly_pullback(mdf, mwin, m_min_al, float(m_adx), m_retr / 100.0, m_pb_al)
                     m_late_flag = bool(pb and pb["move_atr"] > m_late)
                     entry_dir, entry_kind = None, None
                     if msig["direction"] in ("UP", "DOWN") and not m_late_flag:
@@ -1908,6 +1923,11 @@ def main():
                                    f"({m_retr}% परत). आत्ता spot {spot:,.1f}, {pb['aligned_now']}/8 इंडिकेटर अजून एकाच बाजूला. "
                                    + ("✅ pullback आला आहे, खाली entry दिसेल." if pb["ready"] else
                                       ("⚠ भाव मूव्हच्या सुरुवातीच्या पातळीच्या आत गेला (setup बिघडला)." if not pb["held"] else "⏳ pullback ची वाट पाहा.")))
+                    if m_late_flag:
+                        m_reason = ("मूव्ह निघून गेला; pullback आला (entry खाली)" if pb["ready"]
+                                    else f"मूव्ह निघून गेला ({pb['move_atr']:.1f} ATR); strike लपवला; pullback spot {pb['level']:,.1f} ची वाट")
+                    elif msig["direction"] in ("UP", "DOWN"):
+                        m_reason = "FRESH सिग्नल"
                     if entry_dir:
                         try:
                             mch = cached(f"c_{sym}_{m_exp}", 20, lambda: fetch_chain(d_api, meta["id"], m_exp))
@@ -1916,6 +1936,7 @@ def main():
                                     pick_by_premium(mch["oc"], entry_dir, float(m_target), spot, float(m_oi), float(m_spread)))
                         except Exception as e_:
                             mopt = None
+                            m_reason = f"Monthly chain त्रुटी: {e_}"
                             st.error(f"Monthly option chain त्रुटी: {e_}")
                         if mopt:
                             mp = month_plan(mopt, int(lot_size), float(capital), float(risk_pct), float(m_sl), float(m_t1), float(m_t2))
@@ -1925,6 +1946,8 @@ def main():
                             for i_ in mopt.get("issues", []):
                                 st.warning("Option: " + i_)
                             if mp["ok"] and mopt["ok"]:
+                                m_strike_txt = f"{mopt['strike']:.0f} {kind} · Entry ~₹{mp['entry']} · SL ₹{mp['sl']} · T1 ₹{mp['t1']} · {mp['lots']} lot"
+                                m_reason = f"{entry_kind} ENTRY"
                                 st.success(f"📅 MONTHLY ENTRY ({entry_kind}): {sym} {mopt['strike']:.0f} {kind} · expiry {m_exp} · Entry ~₹{mp['entry']} · "
                                            f"SL ₹{mp['sl']} · T1 ₹{mp['t1']} (अर्धे विका) · T2 ₹{mp['t2']} · {mp['lots']} lot · "
                                            f"कमाल तोटा ₹{mp['max_loss']:.0f}")
@@ -1944,9 +1967,18 @@ def main():
                                     except Exception:
                                         pass
                             else:
-                                st.info("सिग्नल आहे, पण entry योजना नाही: " + (mp["note"] or "option अटी अपूर्ण"))
+                                m_strike_txt = f"{mopt['strike']:.0f} {kind} (भाव ₹{mopt['ltp']:g}) — योजना नाही"
+                                m_reason = "सिग्नल आहे, पण entry योजना नाही: " + (mp["note"] or "; ".join(mopt.get("issues", [])) or "option अटी अपूर्ण")
+                                st.info(m_reason)
                     elif not m_late_flag:
                         st.caption("सर्व अटी जुळल्यावरच entry दिसेल. आठही एकत्र जुळणे दुर्मिळ आहे; हवे तर सेटिंगमध्ये 7/8 किंवा 6/8 करा.")
+                    st.dataframe(pd.DataFrame([
+                        {"बाब": "Symbol / candle", "माहिती": f"{sym} · {m_tf_txt} · खिडकी {mwin} · spot {spot:,.1f}"},
+                        {"बाब": "Monthly expiry", "माहिती": str(m_exp)},
+                        {"बाब": "झुकाव / एकमत", "माहिती": f"{msig['leaning']} · {msig['aligned']}/8"},
+                        {"बाब": "मूव्ह (ATR)", "माहिती": f"{pb['move_atr']:.1f} ({pb['direction']}, {pb['bars_ago']} candle आधी)" if pb else "—"},
+                        {"बाब": "स्थिती", "माहिती": m_reason},
+                        {"बाब": "Strike", "माहिती": m_strike_txt}]), hide_index=True, use_container_width=True)
                     st.caption("प्रायोगिक; backtest नाही. ₹10 चा monthly strike खूप लांबचा असतो, तो शून्यही होऊ शकतो. आर्थिक सल्ला नाही.")
 
         # ───────── सहमती: चार्ट + OI flow + CAS + V40 (+V34) ─────────
