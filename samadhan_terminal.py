@@ -1040,6 +1040,38 @@ def monthly_pullback(d, window=75, min_aligned=8, adx_min=20.0, retrace=0.5, pb_
     return best
 
 
+STOCK_LIST = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "LT", "ITC",
+    "BHARTIARTL", "HINDUNILVR", "BAJFINANCE", "MARUTI", "SUNPHARMA", "TATASTEEL", "WIPRO", "HCLTECH",
+    "ADANIENT", "ADANIPORTS", "ONGC", "NTPC", "POWERGRID", "COALINDIA", "JSWSTEEL", "ULTRACEMCO",
+    "TITAN", "ASIANPAINT", "NESTLEIND", "M&M", "BAJAJFINSV", "TECHM", "INDUSINDBK", "HINDALCO",
+    "GRASIM", "DRREDDY", "CIPLA", "EICHERMOT", "BPCL", "TATACONSUM", "APOLLOHOSP", "DIVISLAB",
+    "HEROMOTOCO", "BRITANNIA", "SBILIFE",
+]
+
+
+def scan_stock_daily(raw, now, window=10, min_aligned=7, min_fresh=5, adx_min=20.0, late_atr=1.5, retrace=0.4, pb_aligned=3):
+    """Ek stock cha daily candle var Monthly HOLD nikal. status: FRESH / LATE / PULLBACK READY / WAIT / data apura."""
+    df, _ = drop_forming_candle(raw, 1440, now)             # chalu (apurna) divsachi candle vagale jate
+    if df is None or len(df) < 70:
+        return {"status": "डेटा अपुरा", "direction": "-", "aligned": 0, "adx": 0.0, "move_atr": 0.0,
+                "level": None, "close": None, "note": f"candle {0 if df is None else len(df)} (किमान 70)"}
+    sig = monthly_hold_signal(df, window, min_aligned, min_fresh, adx_min)
+    pb = monthly_pullback(df, window, min_aligned, adx_min, retrace, pb_aligned)
+    late = bool(pb and pb["move_atr"] > late_atr)
+    if late and pb["ready"]:
+        status, direction = "PULLBACK READY", pb["direction"]
+    elif late:
+        status, direction = "LATE", pb["direction"]
+    elif sig["direction"] in ("UP", "DOWN"):
+        status, direction = "FRESH", sig["direction"]
+    else:
+        status, direction = "WAIT", sig.get("leaning", "-")
+    return {"status": status, "direction": direction, "aligned": int(sig.get("aligned", 0)), "adx": float(dmi(df)[2].iloc[-1]),
+            "move_atr": float(pb["move_atr"]) if pb else 0.0, "level": float(pb["level"]) if pb else None,
+            "close": float(df["close"].iloc[-1]), "note": ""}
+
+
 def monthly_expiries(exp_list):
     """Pratyek mahinyatli shevtchi expiry (monthly)."""
     last = {}
@@ -1495,6 +1527,45 @@ def main():
         except Exception as e:
             st.error(f"Dhan कनेक्शन त्रुटी: {e}")
             return
+
+        # ───────── Stock scanner (1 DAY candle, F&O stocks) ─────────
+        with st.expander("📊 Stock scanner (1 DAY candle · F&O stocks)", expanded=False):
+            st.caption("Monthly HOLD चाच फॉर्म्युला (KST, DMI, MOM, MACD, ALMA, HMA, VI, EMA9) रोजच्या candle वर. Strike इथे नाही; उमेदवार स्टॉक्स मिळतात. बॅकटेस्ट नाही.")
+            _stx = st.text_area("Stocks (स्वल्पविराम किंवा नवी ओळ)", ", ".join(STOCK_LIST), height=90, key="ss_txt")
+            _c1, _c2, _c3, _c4 = st.columns(4)
+            _sw = _c1.number_input("खिडकी (दिवस)", 2, 60, 10, key="ss_w")
+            _sa = _c2.number_input("किमान एकमत /8", 4, 8, 7, key="ss_a")
+            _sf = _c3.number_input("किमान ताजे cross", 0, 8, 5, key="ss_f")
+            _sx = _c4.number_input("ADX किमान", 10.0, 40.0, 20.0, 1.0, key="ss_x")
+            _sall = st.checkbox("WAIT सुद्धा दाखवा", False, key="ss_all")
+            if st.button("🔍 स्कॅन करा (1 DAY)", key="ss_go"):
+                _syms = [x.strip().upper() for x in _stx.replace("\n", ",").split(",") if x.strip()]
+                _bar, _rows, _fail = st.progress(0.0), [], []
+                for _i, _sy in enumerate(_syms, 1):
+                    try:
+                        _raw = tsl.get_historical_data(_sy, "NSE", "DAY")
+                        _r = scan_stock_daily(_raw, now, int(_sw), int(_sa), int(_sf), float(_sx))
+                        _r["symbol"] = _sy
+                        _rows.append(_r)
+                    except Exception as _e:
+                        _fail.append(f"{_sy}: {str(_e)[:80]}")
+                    _bar.progress(_i / max(1, len(_syms)))
+                    time.sleep(1.0)
+                st.session_state["stock_scan"] = {"rows": _rows, "fail": _fail, "t": now}
+            _res = st.session_state.get("stock_scan")
+            if _res:
+                _pr = {"PULLBACK READY": 0, "FRESH": 1, "LATE": 2, "WAIT": 3}
+                _show = [r for r in _res["rows"] if _sall or r["status"] != "WAIT"]
+                _show.sort(key=lambda r: (_pr.get(r["status"], 9), -r["aligned"], -r["adx"]))
+                st.caption(f"निकाल {_res['t']:%d-%b %H:%M} · {len(_res['rows'])} पैकी {len(_show)} दाखवले")
+                if _show:
+                    _sd = pd.DataFrame(_show)[["symbol", "status", "direction", "aligned", "adx", "move_atr", "level", "close", "note"]]
+                    st.dataframe(_sd.round(2), hide_index=True, use_container_width=True)
+                    st.download_button("⬇ CSV", _sd.to_csv(index=False).encode("utf-8-sig"), "stock_scan.csv", "text/csv", key="ss_dl")
+                else:
+                    st.info("एकही stock अटीत बसत नाही.")
+                if _res["fail"]:
+                    st.warning("तुटलेले (symbol/timeframe तपासा): " + "; ".join(_res["fail"][:10]))
 
         if meta["id"] <= 0:
             st.info("कमोडिटी: sidebar मध्ये 'Underlying security id' (चालू महिन्याचे FUTURE चे Dhan id) भरा, मग हे सुरू होईल.")
