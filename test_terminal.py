@@ -685,4 +685,44 @@ assert not L.add_today_from_intraday(_o, _im, _dt(2026, 11, 23, 15, 0))[1]      
 assert L.scan_stock_daily(_o, _dt(2026, 11, 23, 16, 0), 10, 7, 5, 20.0, 1.0, 0.4, 3, 5, 15.0, True)["asof"] == "23-Nov"
 print("34 OK aajchi candle 5-min varun")
 
+# 35) strike tape: VWAP, build-up zone, limit sugg
+_tp = {}
+_pts = [(100, 100.0, 1000, 5000), (101, 104.0, 1500, 5200), (102, 112.0, 2500, 5900), (103, 118.0, 3300, 6600), (104, 121.0, 3400, 6500), (105, 120.0, 3600, 6500)]
+for _t, _p_, _v, _o in _pts:
+    L.tape_update(_tp, (25300, "ce"), _t, "2026-11-24", _p_, _v, _o)
+assert len(_tp[(25300, "ce")]) == len(_pts)
+L.tape_update(_tp, (25300, "ce"), 105.2, "2026-11-24", 120.0, 3600, 6500)              # 1 sek madhe dusri nond = ignore
+assert len(_tp[(25300, "ce")]) == len(_pts)
+_s = L.tape_stats(_tp[(25300, "ce")])
+assert 105 < _s["vwap"] < 120 and _s["zone_lo"] == 104.0 and _s["zone_hi"] == 118.0, _s      # OI vadhla: 104, 112, 118
+_ls = L.limit_suggest(_s, 120.0)
+assert _ls["limit"] < 120 and _ls["limit"] >= 84 and _ls["status"], _ls
+assert "उशीर" in L.limit_suggest({"vwap": 80.0, "zone_avg": None}, 120.0)["status"]
+assert "झोनजवळ" in L.limit_suggest({"vwap": 118.0, "zone_avg": None}, 120.0)["status"]
+assert L.limit_suggest({"vwap": None, "zone_avg": None}, 100.0)["limit"] == 90.0
+L.tape_update(_tp, (25300, "ce"), 200, "2026-11-25", 90.0, 100, 1000)                  # divas badalla: juni nond pusato
+assert len(_tp[(25300, "ce")]) == 1
+print("35 OK tape:", round(_s["vwap"], 1), _s["zone_lo"], _s["zone_hi"], _ls["limit"], _ls["status"])
+
+# 36) V34 itihas
+_lg = []
+assert L.v34h_add(_lg, 1000, "SENSEX", "2026-11-26", "UP", 85000.0, "ce", 120.0, 108.0, {"vwap": 110.0, "zone_lo": 105.0, "zone_hi": 118.0, "stage": "S3 · 80%"})
+assert not L.v34h_add(_lg, 1100, "SENSEX", "2026-11-26", "UP", 85000.0, "ce", 121.0, 109.0, {})       # 15 min madhe duhera nahi
+assert not L.v34h_add(_lg, 1200, "SENSEX", "2026-11-26", "UP", 85100.0, "ce", 0.0, 1.0, {})            # LTP 0 = nahi
+_path = iter([118.0, 110.0, 107.0, 130.0, 150.0, 140.0])
+_ts = [1100, 1200, 1300, 1900, 2400, 4700]
+for _t, _l in zip(_ts, _path):
+    L.v34h_update(_lg, _t, "SENSEX", "2026-11-26", lambda k, s_, _l=_l: _l)
+r0 = _lg[0]
+assert r0["filled"] and r0["t_fill"] == 1300 and r0["min_ltp"] == 107.0 and r0["max_ltp"] == 150.0 and r0["status"] == "DONE", r0
+assert abs(r0["max_after_fill"] - 150.0) < 1e-9
+_rw = L.v34h_rows(_lg)[0]
+assert _rw["limit लागली?"] == "हो" and _rw["सर्वात खाली %"] == -10.8 and _rw["सर्वात वर %"] == 25.0 and _rw["लागल्यावर वर %"] == round((150 / 108 - 1) * 100, 1), _rw
+_lg2 = []
+L.v34h_add(_lg2, 0, "NIFTY", "2026-11-26", "DOWN", 24000.0, "pe", 100.0, 90.0, {})
+for _t in (100, 500, 1300, 4000):
+    L.v34h_update(_lg2, _t, "NIFTY", "2026-11-26", lambda k, s_: 105.0 + _t / 100)                    # limit kadhich lagli nahi
+assert not _lg2[0]["filled"] and _lg2[0]["status"] == "DONE" and L.v34h_rows(_lg2)[0]["limit लागली?"] == "नाही"
+print("36 OK V34 itihas:", _rw["limit लागली?"], _rw["सर्वात खाली %"], _rw["सर्वात वर %"])
+
 print("\nSAGLYA CHACHNYA PASS")
