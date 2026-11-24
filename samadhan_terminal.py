@@ -1346,6 +1346,101 @@ def consensus(votes, min_agree=2):
     return "WAIT", up if len(up) >= len(dn) else dn, dn if len(up) >= len(dn) else up
 
 
+# ───────── Strike tape: V34 strike cha VWAP / build-up zone / limit sugg (aamchya scan madhun, andaje) ─────────
+def tape_update(store, key, ts, day, ltp, vol, oi):
+    """Pratyek scan la (ltp, volume, oi) nondvato. Divas badalla ki juni nond pusato. ts = unix sekand."""
+    h = store.setdefault(key, [])
+    if h and h[-1].get("day") != day:
+        h.clear()
+    if h and ts - h[-1]["ts"] < 1:
+        return h
+    h.append({"ts": ts, "day": day, "ltp": float(ltp), "vol": float(vol), "oi": float(oi)})
+    del h[:-600]
+    return h
+
+
+def tape_stats(h):
+    """VWAP = sum(ltp x vadhlela volume)/sum(vadhlela volume) (fakt aamchya scan madhla). Build-up zone = jevha OI vadhla tevhachi LTP chi pattali."""
+    num = den = 0.0
+    zone = []
+    for a, b in zip(h, h[1:]):
+        dv = b["vol"] - a["vol"]
+        if dv <= 0:
+            continue
+        num += b["ltp"] * dv
+        den += dv
+        if b["oi"] - a["oi"] > 0:
+            zone.append((b["ltp"], dv))
+    out = {"n": len(h), "vwap": (num / den) if den > 0 else None, "vol_scanned": den, "zone_lo": None, "zone_hi": None, "zone_avg": None,
+           "ltp": h[-1]["ltp"] if h else None}
+    if zone:
+        pr = [p_ for p_, _ in zone]
+        out.update(zone_lo=min(pr), zone_hi=max(pr), zone_avg=sum(p_ * w_ for p_, w_ in zone) / sum(w_ for _, w_ in zone))
+    return out
+
+
+def limit_suggest(stats, ltp, dhan_avg=None):
+    """Limit order chi suchavleli kimmat + sthiti. Andaje; backtest nahi."""
+    refs = [x for x in (dhan_avg, stats.get("vwap"), stats.get("zone_avg")) if x and x > 0]
+    ref = refs[0] if refs else None
+    cand = [x for x in refs if x < ltp]
+    limit = max(cand) if cand else ltp * 0.90
+    limit = max(limit, ltp * 0.70)
+    if ref:
+        dist = (ltp - ref) / ref * 100
+        stat = "झोनजवळ (entry चालेल)" if dist <= 5 else ("थोडा पुढे" if dist <= 15 else "उशीर: भाव झोनपासून खूप पुढे, limit ची वाट पाहा")
+    else:
+        dist, stat = None, "संदर्भ भाव नाही (स्कॅन कमी)"
+    return {"limit": _tick(limit), "ref": ref, "dist_pct": dist, "status": stat}
+
+
+# ───────── V34 entry itihas: signal cha LTP, suchavleli limit, limit lagli ka, kiti khali/var gela (aamchya scan varun) ─────────
+def v34h_add(log, now_ts, sym, expiry, direction, strike, side, ltp0, limit, info, dedupe_min=15):
+    for r in reversed(log):
+        if r["sym"] == sym and r["dir"] == direction and r["strike"] == strike and r["side"] == side and now_ts - r["t"] < dedupe_min * 60:
+            return False
+    if not ltp0 or ltp0 <= 0:
+        return False
+    rec = {"t": now_ts, "sym": sym, "expiry": expiry, "dir": direction, "strike": strike, "side": side, "ltp0": float(ltp0),
+           "limit": float(limit) if limit else None, "min_ltp": float(ltp0), "max_ltp": float(ltp0), "filled": False, "t_fill": None,
+           "max_after_fill": None, "status": "OPEN"}
+    rec.update(info or {})
+    log.append(rec)
+    return True
+
+
+def v34h_update(log, now_ts, sym, expiry, ltp_of, horizon_min=60, fill_min=20):
+    """ltp_of(strike, side) -> chalu LTP / None. Limit 'lagli' = fill_min madhe LTP limit paryant ala (scan vrun; kharat madhe mdhe lagu shakte)."""
+    for r in log:
+        if r["status"] != "OPEN" or r["sym"] != sym or r["expiry"] != expiry:
+            continue
+        ltp = ltp_of(r["strike"], r["side"])
+        if ltp and ltp > 0:
+            r["min_ltp"], r["max_ltp"] = min(r["min_ltp"], ltp), max(r["max_ltp"], ltp)
+            if not r["filled"] and r.get("limit") and now_ts - r["t"] <= fill_min * 60 and ltp <= r["limit"]:
+                r["filled"], r["t_fill"], r["max_after_fill"] = True, now_ts, ltp
+            if r["filled"]:
+                r["max_after_fill"] = max(r["max_after_fill"] or ltp, ltp)
+        if now_ts - r["t"] > horizon_min * 60:
+            r["status"] = "DONE"
+
+
+def v34h_rows(log):
+    out = []
+    for r in log:
+        l0, lim = r["ltp0"], r.get("limit")
+        out.append({"वेळ": datetime.fromtimestamp(r["t"]).strftime("%d-%b %H:%M"), "Symbol": r["sym"], "दिशा": r["dir"],
+                    "Strike": f"{r['strike']:.0f} {'CE' if r['side'] == 'ce' else 'PE'}", "सिग्नलवेळी LTP": round(l0, 2),
+                    "सुचवलेली limit": round(lim, 2) if lim else None,
+                    "limit लागली?": ("हो" if r["filled"] else ("नाही" if r["status"] == "DONE" else "वाट पाहा")),
+                    "सर्वात खाली %": round((r["min_ltp"] / l0 - 1) * 100, 1), "सर्वात वर %": round((r["max_ltp"] / l0 - 1) * 100, 1),
+                    "लागल्यावर वर %": round((r["max_after_fill"] / lim - 1) * 100, 1) if (r["filled"] and lim) else None,
+                    "VWAP": round(r["vwap"], 1) if r.get("vwap") else None,
+                    "झोन": (f"{r['zone_lo']:.0f}–{r['zone_hi']:.0f}" if r.get("zone_lo") else ""),
+                    "stage/rank": r.get("stage", ""), "स्थिती": r["status"]})
+    return out
+
+
 def v34_winner(g):
     """V34 snippet (v34_engine.py) chya exec nantarche globals madhun 'ABSOLUTE CONFIRMED WINNER' kadha.
     Snippet chich ata: hero_list, rank >= 65, equilibrium/choppy nasel tar. Disha: CALL=UP, PUT=DOWN."""
@@ -1461,6 +1556,7 @@ def main():
     JOURNAL = Path(__file__).with_name("entry_journal.json")
     SIGLOG = Path(__file__).with_name("signal_log.json")
     MISSLOG = Path(__file__).with_name("missed_moves.json")
+    V34HIST = Path(__file__).with_name("v34_history.json")
 
     @st.cache_data(ttl=43200, show_spinner="Dhan instrument list उतरवत आहे (मोठी फाईल, पहिल्यांदा थोडा वेळ)...")
     def load_scrip_master():
@@ -1572,6 +1668,9 @@ def main():
                                help="सर्व इंडिकेटर जुळल्यापासून भाव इतक्या ATR पेक्षा जास्त हलला असेल तर नवी entry/strike दाखवत नाही; फक्त pullback ची वाट पाहतो.")
             m_retr = st.slider("Pullback किती % (मूव्हच्या)", 15, 75, 40, 5,
                                help="मूव्हच्या टोकापासून तेवढा % परत आला की pullback entry. 38–50% सामान्य मानतात (तपासलेले नाही).")
+            m_form = st.slider("FORMING (तयार होत आहे): किमान एकमत /8", 3, 7, 5,
+                               help="सर्व अटी जुळायच्या आधी, आत्ता इतके इंडिकेटर एकाच बाजूला आणि मूव्ह अजून कमी असेल तर 'तयार होत आहे' आणि दिशा दाखवतो (फक्त सूचना; entry/Telegram नाही).")
+            m_fadx = st.slider("FORMING: ADX किमान", 5, 30, 15)
             m_pb_al = st.slider("Pullback वेळी किमान किती इंडिकेटर अजून एकाच बाजूला", 2, 8, 3,
                                 help="Pullback मध्ये MOM, EMA9, HMA असे वेगवान इंडिकेटर आधी उलटतात; म्हणून इथे सर्व 8 मागू नका.")
             m_oi = st.number_input("किमान OI (strike वर)", 0.0, 1e7, 1000.0, 500.0)
@@ -1623,6 +1722,11 @@ def main():
             st.session_state["siglog"] = json.loads(SIGLOG.read_text())
         except Exception:
             st.session_state["siglog"] = []
+    if "v34h" not in st.session_state:
+        try:
+            st.session_state["v34h"] = json.loads(V34HIST.read_text())
+        except Exception:
+            st.session_state["v34h"] = []
     if "missed" not in st.session_state:
         try:
             st.session_state["missed"] = json.loads(MISSLOG.read_text())
@@ -2047,6 +2151,23 @@ def main():
         else:
             st.caption("CAS नाही (OI वाढ + premium दबाव हवा; इतिहास जमा व्हायला किमान 2–10 मिनिटे लागतात).")
 
+        with st.expander("📜 V34 entry इतिहास (सिग्नलवेळी LTP, सुचवलेली limit, ती लागली का, पुढे किती खाली/वर गेला)"):
+            _vr = v34h_rows(st.session_state["v34h"])
+            if _vr:
+                _vd = pd.DataFrame(_vr[::-1])
+                st.dataframe(_vd, hide_index=True, use_container_width=True)
+                st.download_button("⬇ V34 इतिहास CSV", _vd.to_csv(index=False).encode("utf-8-sig"), "v34_history.csv", "text/csv", key="v34h_dl")
+                _dn = [r for r in st.session_state["v34h"] if r["status"] == "DONE"]
+                if _dn:
+                    _fl = [r for r in _dn if r["filled"]]
+                    st.caption(f"पूर्ण झालेले {len(_dn)}: limit लागली {len(_fl)} वेळा ({len(_fl) / len(_dn) * 100:.0f}%). "
+                               f"सिग्नलनंतर सरासरी सर्वात खाली {sum((r['min_ltp'] / r['ltp0'] - 1) * 100 for r in _dn) / len(_dn):.1f}%, "
+                               f"सर्वात वर {sum((r['max_ltp'] / r['ltp0'] - 1) * 100 for r in _dn) / len(_dn):.1f}%.")
+            else:
+                st.caption("अजून V34 entry नाही. V34 चा विजेता आला की इथे नोंद होते (अॅप चालू असतानाच).")
+            st.caption("'limit लागली' = 20 मिनिटांत LTP सुचवलेल्या limit पर्यंत आला (स्कॅनवरून; स्कॅनच्या मधे लागली असेल तर कळत नाही). "
+                       "सर्वात खाली/वर = सिग्नलवेळच्या LTP पासून 60 मिनिटांत. स्क्रीन बंद असताना स्कॅन सुटतात. Streamlit Cloud वर फाईल रीस्टार्टवर पुसली जाते, "
+                       "म्हणून CSV उतरवून ठेवा. बॅकटेस्ट नाही; आर्थिक सल्ला नाही.")
         with st.expander("📊 Signal tracker: कोणता engine किती वेळा बरोबर? (spot च्या दिशेने 0.15%, 60 मिनिटांत)"):
             summ = siglog_summary(st.session_state["siglog"])
             n_open = sum(1 for r in st.session_state["siglog"] if r["status"] == "OPEN")
@@ -2151,6 +2272,47 @@ def main():
                     except Exception as e_:
                         st.error(f"V34 इंजिन त्रुटी: {e_}")
                 v34_win = v34_winner(g34)
+                _tape = st.session_state.setdefault("tape", {})
+                if st.session_state.get("tape_ctx") != ctx34:
+                    _tape.clear()
+                    st.session_state["tape_ctx"] = ctx34
+                try:
+                    _smap, _day = strike_map(oc), now.strftime("%Y-%m-%d")
+                    _atm = round(spot / meta["step"]) * meta["step"]
+                    for _k, _nd in _smap.items():
+                        if abs(_k - _atm) <= 6 * meta["step"]:
+                            for _sd in ("ce", "pe"):
+                                _n = (_nd or {}).get(_sd) or {}
+                                if _f(_n.get("last_price")) > 0:
+                                    tape_update(_tape, (_k, _sd), now_ts, _day, _f(_n.get("last_price")), _f(_n.get("volume")), _f(_n.get("oi")))
+                except Exception:
+                    pass
+                if v34_win and v34_win.get("strike") is not None:
+                    _h = _tape.get((v34_win["strike"], v34_win["side"]), [])
+                    _st = tape_stats(_h)
+                    _nd = (strike_map(oc).get(v34_win["strike"]) or {}).get(v34_win["side"]) or {}
+                    _ltp, _davg = _f(_nd.get("last_price")), _f(_nd.get("average_price")) or None
+                    if _ltp > 0:
+                        _ls = limit_suggest(_st, _ltp, _davg)
+                        v34_win["limit"] = _ls
+                        v34h_add(st.session_state["v34h"], now_ts, sym, expiry, v34_win["dir"], v34_win["strike"], v34_win["side"], _ltp, _ls["limit"],
+                                 {"vwap": _st["vwap"], "zone_lo": _st["zone_lo"], "zone_hi": _st["zone_hi"], "ref": _ls["ref"],
+                                  "stage": f"{v34_win['stage']} · {v34_win['score']:.0f}%", "vol": _f(_nd.get("volume")), "oi": _f(_nd.get("oi")), "spot0": float(spot)})
+                        _zt = (f"₹{_st['zone_lo']:.1f}–₹{_st['zone_hi']:.1f} (सरासरी ₹{_st['zone_avg']:.1f})" if _st["zone_lo"] else "अजून नाही")
+                        st.info(f"📍 **V34 strike {v34_win['strike']:.0f} {'CE' if v34_win['side'] == 'ce' else 'PE'}**: LTP ₹{_ltp:.1f} · "
+                                + (f"Dhan सरासरी भाव ₹{_davg:.1f} · " if _davg else "")
+                                + (f"स्कॅन-VWAP ₹{_st['vwap']:.1f} · " if _st["vwap"] else "")
+                                + f"build-up झोन (OI वाढताना LTP) {_zt} · आजचा volume {_f(_nd.get('volume')):,.0f} · OI {_f(_nd.get('oi')):,.0f}\n\n"
+                                f"👉 **सुचवलेली limit ऑर्डर ≈ ₹{_ls['limit']}** · स्थिती: {_ls['status']}"
+                                + (f" ({_ls['dist_pct']:+.0f}% संदर्भ भावापासून)" if _ls["dist_pct"] is not None else ""))
+                        st.caption(f"हे फक्त आमच्या {_st['n']} स्कॅनमधून काढलेले अंदाज आहेत, ऑपरेटरचा खरा भाव नाही; अॅप बंद असताना डेटा सुटतो. बॅकटेस्ट नाही. आर्थिक सल्ला नाही.")
+                try:
+                    _smx = strike_map(oc)
+                    v34h_update(st.session_state["v34h"], now_ts, sym, expiry,
+                                lambda k_, s_: _f(((_smx.get(k_) or {}).get(s_) or {}).get("last_price")) or None)
+                    V34HIST.write_text(json.dumps(st.session_state["v34h"]))
+                except Exception:
+                    pass
                 if v34_win:
                     _q = g34.get("market_bias")          # V34 cha 5-scan queue kal: CALL / PUT / NEUTRAL
                     _rel = ("queue तटस्थ" if _q not in ("CALL", "PUT") else
@@ -2162,7 +2324,8 @@ def main():
                                             f"{v34_win['stage']} · rank {v34_win['score']:.0f}% · premium ₹{(v34_win['premium'] or 0):.2f} · "
                                             f"{v34_win['alloc']} ({v34_win['action']})\n"
                                             f"Spot {spot:,.1f} · Expiry {expiry} · {_rel} · {now:%H:%M}\n"
-                                            "फक्त माहिती; order आपोआप जात नाही. सल्ला नाही.")
+                                            + (f"सुचवलेली limit ≈ ₹{v34_win['limit']['limit']} · {v34_win['limit']['status']}\n" if v34_win.get("limit") else "")
+                                            + "फक्त माहिती; order आपोआप जात नाही. सल्ला नाही.")
                         st.toast("V34 Telegram: " + ("पाठवला" if _ok else "पाठवला नाही (secrets तपासा)"))
                     siglog_add(SL_, now_ts, sym, expiry, f"V34 WINNER ({_rel})", v34_win["dir"], v34_win["strike"], v34_win["side"],
                                spot, v34_win["score"], _exp_day)
@@ -2219,6 +2382,23 @@ def main():
                                     else f"मूव्ह निघून गेला ({pb['move_atr']:.1f} ATR); strike लपवला; pullback spot {pb['level']:,.1f} ची वाट")
                     elif msig["direction"] in ("UP", "DOWN"):
                         m_reason = "FRESH सिग्नल"
+                    else:
+                        pf_ = monthly_pullback(mdf, mwin, int(m_form), float(m_fadx), m_retr / 100.0, m_pb_al)
+                        if pf_ and pf_["bars_ago"] == 0 and pf_["move_atr"] <= m_late:
+                            m_reason = (f"⏳ FORMING (तयार होत आहे): {pf_['direction']} {'↑' if pf_['direction'] == 'UP' else '↓'} · "
+                                        f"{pf_['aligned_now']}/8 एकमत · मूव्ह {pf_['move_atr']:.2f} ATR · entry अजून नाही")
+                            st.info(m_reason)
+                            try:
+                                _mc = cached(f"c_{sym}_{m_exp}", 20, lambda: fetch_chain(d_api, meta["id"], m_exp))
+                                _fo = (pick_by_delta(_mc["oc"], pf_["direction"], float(m_dlo), float(m_dhi), spot, meta["step"], float(m_oi), float(m_spread))
+                                       if m_mode.startswith("Delta") else
+                                       pick_by_premium(_mc["oc"], pf_["direction"], float(m_target), spot, float(m_oi), float(m_spread)))
+                                if "strike" in _fo:
+                                    m_strike_txt = (f"{_fo['strike']:.0f} {'CALL (CE)' if pf_['direction'] == 'UP' else 'PUT (PE)'} · भाव ₹{_fo['ltp']:g}"
+                                                    f" · delta {_fo['delta']:.2f} (पूर्वावलोकन, entry नाही)")
+                                    st.caption("संभाव्य strike (आत्ताच्या भावावर): " + m_strike_txt)
+                            except Exception as e_:
+                                st.caption(f"Strike पूर्वावलोकन त्रुटी: {e_}")
                     if entry_dir:
                         try:
                             mch = cached(f"c_{sym}_{m_exp}", 20, lambda: fetch_chain(d_api, meta["id"], m_exp))
